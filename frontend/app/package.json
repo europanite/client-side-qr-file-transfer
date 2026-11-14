@@ -1,0 +1,31 @@
+{
+  "name": "client-side-qr-file-transfer",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start --web",
+    "web": "expo start --web",
+    "build": "expo export -p web",
+    "test": "node --experimental-strip-types --test __tests__/protocol.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "expo": "~58.0.25",
+    "@expo/metro-runtime": "~58.0.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-web": "^0.21.0",
+    "qrcode": "^1.5.4",
+    "jsqr": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "~19.3.0",
+    "typescript": "~5.9.2",
+    "babel-preset-expo": "~58.0.0"
+  },
+  "engines": { "node": ">=22.13.0" }
+}

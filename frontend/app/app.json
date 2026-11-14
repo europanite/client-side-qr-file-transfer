@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "Client-Side QR File Transfer",
+    "slug": "client-side-qr-file-transfer",
+    "version": "1.0.0",
+    "userInterfaceStyle": "dark",
+    "orientation": "default",
+    "experiments": { "baseUrl": "/client-side-qr-file-transfer" },
+    "web": { "output": "single", "bundler": "metro", "name": "Client-Side QR File Transfer" }
+  }
+}

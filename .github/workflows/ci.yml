@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        working-directory: frontend/app
+        run: npm install --no-audit --no-fund
+      - name: Run protocol unit tests
+        working-directory: frontend/app
+        run: npm test
+      - name: Typecheck
+        working-directory: frontend/app
+        run: npm run typecheck
+      - name: Production export smoke test
+        working-directory: frontend/app
+        run: npm run build
