@@ -1,7 +1,11 @@
-FROM node:22-alpine
+FROM node:24-bookworm-slim
+
 WORKDIR /app
+
 COPY package*.json ./
+
 RUN npm install --no-audit --no-fund
+
 COPY . .
-EXPOSE 8081
+
 CMD ["npm", "run", "web", "--", "--host", "lan", "--port", "8081"]
