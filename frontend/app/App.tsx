@@ -3,7 +3,7 @@ import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import {
   acceptFrame, assemble, buildSequence, decodeFrame, emptyReceiver,
-  encodeStep, isComplete, missingIndices, prepareFile,
+  encodeStep, isComplete, CHUNK_BYTES, metadataPartCount, missingIndices, missingMetadataIndices, prepareFile,
   type Prepared, type Receiver,
 } from './src/protocol';
 import './styles.css';
@@ -28,7 +28,7 @@ function useQrImage(value: string | null, size = QR_RENDER_SIZE): { image: strin
     let active = true;
     if (!value) { setState({ image: '', error: '' }); return; }
     QRCode.toDataURL(value, {
-      errorCorrectionLevel: 'M', margin: 4, width: size,
+      errorCorrectionLevel: 'L', margin: 4, width: size,
       color: { dark: '#090909', light: '#ffffff' },
     }).then((image) => {
       if (active) setState({ image, error: '' });
@@ -52,6 +52,7 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [intervalMs, setIntervalMs] = useState(DEFAULT_INTERVAL_MS);
   const [jumpIndex, setJumpIndex] = useState('1');
+  const [metaJumpIndex, setMetaJumpIndex] = useState('1');
   const [receiver, setReceiver] = useState<Receiver>(emptyReceiver);
   const [cameraError, setCameraError] = useState('');
   const [cameraActive, setCameraActive] = useState(false);
@@ -68,13 +69,15 @@ export default function App() {
   const videoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastTickRef = useRef(0);
   const isMountedRef = useRef(true);
-  const sequence = useMemo(() => prepared ? buildSequence(prepared.header.total) : [], [prepared]);
+  const metaCount = prepared ? metadataPartCount(prepared) : 0;
+  const sequence = useMemo(() => prepared ? buildSequence(prepared.header.total, metadataPartCount(prepared)) : [], [prepared]);
   const currentStep = sequence[position];
   const currentQR = useMemo(() => prepared && currentStep ? encodeStep(prepared, currentStep) : null,
     [prepared, currentStep]);
   const senderQR = useQrImage(currentQR);
   const receivedQR = useQrImage(receiver.lastQR);
   const missing = useMemo(() => missingIndices(receiver), [receiver]);
+  const missingMeta = useMemo(() => missingMetadataIndices(receiver), [receiver]);
   const complete = isComplete(receiver);
   const expected = receiver.total;
 
@@ -109,8 +112,8 @@ export default function App() {
       setReceiver((previous) => acceptFrame(previous, frame, text));
       setScanError('');
     } catch (error) {
-      // A camera may see unrelated QR codes; only report a QRF1 checksum failure.
-      if (text.startsWith('QRF1|')) setScanError(String(error));
+      // Ignore unrelated QR codes; report malformed frames from this protocol.
+      if (text.startsWith('QRF2|')) setScanError(String(error));
     }
   }, []);
 
@@ -185,6 +188,7 @@ export default function App() {
       const next = await prepareFile(file);
       setPrepared(next);
       setJumpIndex('1');
+      setMetaJumpIndex('1');
       setPlaying(true);
     } catch (error) {
       setSenderError(String(error));
@@ -213,6 +217,16 @@ export default function App() {
     setScanError('');
     setVerifyError('');
     setFileResult(null);
+  };
+  const showMetadata = () => {
+    if (!prepared) return;
+    const num = Number(metaJumpIndex);
+    if (!Number.isInteger(num) || num < 1 || num > metaCount) {
+      setSenderError('Enter a valid metadata part number.');
+      return;
+    }
+    const target = sequence.findIndex((step) => step.kind === 'metadata' && step.index === num - 1);
+    if (target >= 0) { setPlaying(false); setPosition(target); setSenderError(''); }
   };
   const showChunk = () => {
     if (!prepared) return;
@@ -268,13 +282,14 @@ export default function App() {
             <span>File: <strong>{prepared?.header.name || 'None'}</strong></span>
             <span>Size: <strong>{prepared ? readableBytes(prepared.header.size) : '—'}</strong></span>
             <span>Chunks: <strong>{prepared?.header.total ?? '—'}</strong></span>
+            <span>Bytes per QR: <strong>{CHUNK_BYTES}</strong></span>
           </div>
           <div className="qr-box sender-qr" aria-label="Transmitted QR code">
-            {senderQR.image ? <img src={senderQR.image} alt={`QR code: ${currentStep?.kind === 'header' ? 'metadata' : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
+            {senderQR.image ? <img src={senderQR.image} alt={`QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
               : <div className="placeholder">{senderQR.error || 'Select a file to display QR codes'}</div>}
           </div>
-          <div className="qr-status">{prepared && currentStep ? (currentStep.kind === 'header'
-            ? 'Metadata QR · filename / size / SHA-256'
+          <div className="qr-status">{prepared && currentStep ? (currentStep.kind === 'metadata'
+            ? `Metadata QR · part ${currentStep.index + 1} / ${metaCount}`
             : `Data QR · chunk ${currentStep.index + 1} / ${prepared.header.total}`) : 'No active transfer'}</div>
           <div className="toolbar">
             <button disabled={!prepared} onClick={() => setPlaying((prev) => !prev)}>{playing ? 'Pause' : 'Play / Loop'}</button>
@@ -283,11 +298,16 @@ export default function App() {
           </div>
           <label className="row-label" htmlFor="interval">Frame interval: <strong>{(intervalMs / 1000).toFixed(1)} seconds</strong></label>
           <input id="interval" type="range" min="500" max="5000" step="100" value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))}/>
-          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. Header repeats every 16 data chunks and the entire sequence loops.</div>
+          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. Small metadata QRs repeat every 64 data chunks; the sequence loops.</div>
           <div className="jump-row">
             <label htmlFor="jump-index">Show chunk #</label>
             <input id="jump-index" type="number" min="1" max={prepared?.header.total ?? 1} value={jumpIndex} onChange={(e) => setJumpIndex(e.target.value)} />
             <button className="secondary-button" disabled={!prepared} onClick={showChunk}>Jump & pause</button>
+          </div>
+          <div className="jump-row">
+            <label htmlFor="metadata-jump-index">Show metadata #</label>
+            <input id="metadata-jump-index" type="number" min="1" max={metaCount || 1} value={metaJumpIndex} onChange={(e) => setMetaJumpIndex(e.target.value)} />
+            <button className="secondary-button" disabled={!prepared} onClick={showMetadata}>Jump metadata</button>
           </div>
           <p className="small-note">A camera cannot acknowledge received frames through this one-way channel. Use the missing-chunk list on the Receiver and replay or jump to the missing QR.</p>
           {prepared && <div className="time-hint">One complete cycle: ~{Math.ceil(sequence.length * intervalMs / 60000)} minutes at the current speed. Small files work best.</div>}
@@ -317,6 +337,8 @@ export default function App() {
           {scanError && <p className="error" role="alert">{scanError}</p>}
           <div className="progress-label"><span>Received chunks</span><strong>{receiver.received} / {expected ?? '?'}</strong></div>
           <progress max={expected || 1} value={receiver.received} />
+          <div className="progress-label"><span>Metadata QR parts</span><strong>{Object.keys(receiver.metadata).length} / {receiver.metadataTotal ?? '?'}</strong></div>
+          {missingMeta.length > 0 && <div className="line-muted">Missing metadata parts: {abbreviateMissing(missingMeta)}</div>}
           <div className="line-muted" aria-live="polite">{receiver.notice}</div>
           <div className="stats">
             <span>File: <strong>{receiver.header?.name || 'Waiting for metadata'}</strong></span>

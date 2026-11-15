@@ -174,13 +174,16 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
         }
       }
     }
-    async function showMetadata() {
-      // Select the metadata frame even if the auto-loop advanced before Pause.
-      for (let i = 0; i < 12; i += 1) {
-        if ((await sender.locator('.sender .qr-status').textContent())?.includes('Metadata QR')) return;
-        await sender.getByRole('button', { name: 'Previous' }).click();
+    async function scanMetadata() {
+      // Metadata is deliberately fragmented into low-density QR frames.
+      const total = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));
+      assert.ok(total >= 2, 'Expected multiple metadata frames');
+      for (let part = 1; part <= total; part += 1) {
+        await sender.locator('#metadata-jump-index').fill(String(part));
+        await sender.getByRole('button', { name: 'Jump metadata' }).click();
+        await scan(`Metadata QR · part ${part} / ${total}`,
+          part === total ? 'File metadata received' : `Received metadata part ${part} / ${total}`);
       }
-      assert.fail('Cannot find metadata QR in sender sequence');
     }
     async function jumpToChunk(n, expectedNotice) {
       await sender.locator('#jump-index').fill(String(n));
@@ -194,8 +197,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await sender.getByRole('button', { name: 'Pause', exact: true }).click();
       await sender.waitForFunction((total) =>
         document.querySelector('.sender .stats')?.textContent?.includes(`Chunks: ${total}`), chunkCount);
-      await showMetadata();
-      await scan('Metadata QR', 'File metadata received');
+      await scanMetadata();
     }
     async function verifyDownload(name, original) {
       await receiver.locator('.receiver .stats').getByText('Verified', { exact: true }).waitFor();
@@ -208,7 +210,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     }
 
     const filename = '転送📁.bin';
-    const payload = Buffer.from(Array.from({ length: 900 }, (_, n) => (n * 73 + (n >> 3)) & 255));
+    const payload = Buffer.from(Array.from({ length: 135 }, (_, n) => (n * 73 + (n >> 3)) & 255));
     await upload(filename, payload, 3);
     await jumpToChunk(2, 'Received chunk 2 / 3');
     await receivedCount(receiver, '1 / 3');
