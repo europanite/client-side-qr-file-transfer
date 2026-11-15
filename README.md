@@ -1,6 +1,7 @@
 # [Client-Side QR File Transfer](https://github.com/europanite/client-side-qr-file-transfer)
 
 [![CI](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/ci.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/ci.yml)
+[![docker](https://github.com/europanite/semantic-tree/actions/workflows/docker.yml/badge.svg)](https://github.com/europanite/semantic-tree/actions/workflows/docker.yml)
 [![GitHub Pages](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/pages.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/pages.yml)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Architecture](https://img.shields.io/badge/architecture-client--side--only-yellow)
@@ -64,6 +65,16 @@ Open the local URL printed by Expo (usually `http://localhost:8081`). `localhost
 - Files are stored **in memory only**. Closing or refreshing the Receiver page loses the current transfer. No recovery across page reloads is implemented.
 - The prototype does **not** have encryption, sender authentication, error-correcting multi-frame codes, or bidirectional ACK. Anyone able to photograph the displayed QR codes can potentially recover the file. Do **not** send confidential data in public places.
 
+## Two-browser QR transfer E2E test
+
+Run the actual sender and receiver UIs in **two independent Chromium processes**. Playwright transfers each rendered QR **image** into a canvas-backed virtual camera on the receiver. The browser's normal video capture and `jsQR` decoding code reconstructs the file; the test downloads it and checks that the bytes and filename are identical to the source.
+
+```bash
+docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit --exit-code-from browser_e2e
+# To remove the stopped container:
+docker compose -f docker-compose.e2e.yml down
+```
+
 ## QR protocol v1 (`QRF1`)
 
 All fields are ASCII separated by `|`, with base64url without padding for binary and UTF-8 text fields.
@@ -82,13 +93,6 @@ cd frontend/app
 npm install
 npm run build
 ```
-
-The Expo export lands in `frontend/app/dist/`. The repository includes `.github/workflows/pages.yml` to build and deploy on each push to `main` using GitHub Pages Actions. In the GitHub repository, enable **Settings → Pages → Build and deployment → GitHub Actions**. The build deliberately uses Expo's `web.output: "single"` so no server rendering or API routes are required.
-
-Docker Compose commands for local development and verification are in [Quick start](#quick-start-docker-compose). CI continues to use `docker compose -f docker-compose.test.yml up --build --exit-code-from frontend_test`.
-
-**Note about dependency lockfiles:** The supplied template export did not contain a `package.json` or `package-lock.json`. This repository provides a fresh manifest compatible with Expo SDK 58. A dependency lockfile cannot be generated without registry access in this build environment. After `npm install` on an online development machine, commit the resulting `frontend/app/package-lock.json`, then consider changing CI/Docker installation from `npm install` to `npm ci` for reproducible builds.
-
 
 ## License
 
