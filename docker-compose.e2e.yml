@@ -1,0 +1,11 @@
+services:
+  browser_e2e:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+    init: true
+    # Chromium benefits from a larger shared-memory area in containers.
+    shm_size: 1gb
+    volumes:
+      - ./tests/e2e/artifacts:/workspace/tests/e2e/artifacts
+    command: ["node", "--test", "tests/e2e/qr-transfer.e2e.mjs"]

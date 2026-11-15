@@ -1,0 +1,22 @@
+name: Browser E2E
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qr-transfer-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v7
+      - name: Two-browser optical transfer test
+        run: docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit --exit-code-from browser_e2e
+      - name: Upload browser screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: browser-e2e-failures
+          path: tests/e2e/artifacts/*.png
+          if-no-files-found: ignore
