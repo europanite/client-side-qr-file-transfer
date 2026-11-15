@@ -112,10 +112,19 @@ async function waitForVisibleQr(sender, status, previousSource) {
   return sender.locator('.sender-qr img').getAttribute('src');
 }
 
+// Two independent progress counters exist: data chunks and metadata QR parts.
+// Always select the data counter by its label rather than relying on DOM order.
+function receivedChunksProgress(receiver) {
+  return receiver.locator('.receiver .progress-label')
+    .filter({ hasText: 'Received chunks' }).locator('strong');
+}
+
 async function receivedCount(receiver, expected) {
-  await receiver.waitForFunction((expected) =>
-    document.querySelector('.receiver .progress-label strong')?.textContent?.trim() === expected,
-  expected, { timeout: 15_000 });
+  await receiver.waitForFunction((expected) => {
+    const label = Array.from(document.querySelectorAll('.receiver .progress-label'))
+      .find((element) => element.querySelector('span')?.textContent?.trim() === 'Received chunks');
+    return label?.querySelector('strong')?.textContent?.trim() === expected;
+  }, expected, { timeout: 15_000 });
 }
 
 test('two browsers scan rendered QR frames and download byte-identical files', { timeout: 120_000 }, async (t) => {
@@ -167,7 +176,9 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
         } catch (error) {
           const state = await receiver.evaluate(() => ({
             notice: document.querySelector('.receiver [aria-live="polite"]')?.textContent,
-            progress: document.querySelector('.receiver .progress-label strong')?.textContent,
+            progress: Array.from(document.querySelectorAll('.receiver .progress-label'))
+              .find((element) => element.querySelector('span')?.textContent?.trim() === 'Received chunks')
+              ?.querySelector('strong')?.textContent,
             cameraButton: document.querySelector('.receiver .toolbar button')?.textContent,
           }));
           throw new Error(`QR not received (${status}): ${JSON.stringify(state)}`, { cause: error });
@@ -219,7 +230,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     await receivedCount(receiver, '2 / 3');
     await jumpToChunk(2, null); // Duplicate QR frame must not count twice.
     await receiver.waitForTimeout(600);
-    assert.equal((await receiver.locator('.receiver .progress-label strong').textContent())?.trim(), '2 / 3');
+    assert.equal((await receivedChunksProgress(receiver).textContent())?.trim(), '2 / 3');
     await jumpToChunk(3, 'Received chunk 3 / 3');
     await receivedCount(receiver, '3 / 3');
     await verifyDownload(filename, payload);
@@ -234,7 +245,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     await receiver.getByRole('button', { name: 'Start front camera' }).click();
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
     await receiver.waitForTimeout(350);
-    assert.equal((await receiver.locator('.receiver .progress-label strong').textContent())?.trim(), '0 / ?',
+    assert.equal((await receivedChunksProgress(receiver).textContent())?.trim(), '0 / ?',
       'The previous transfer was unexpectedly reacquired after reset');
 
     // A second transfer on the same two browser processes tests empty files.
