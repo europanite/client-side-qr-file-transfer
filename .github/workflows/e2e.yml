@@ -1,4 +1,4 @@
-name: Browser E2E (two Chromium instances)
+name: Browser E2E
 on:
   push:
   pull_request:
@@ -8,14 +8,14 @@ permissions:
 jobs:
   qr-transfer-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Two-browser optical transfer test
         run: docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit --exit-code-from browser_e2e
       - name: Upload browser screenshots on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: browser-e2e-failures
           path: tests/e2e/artifacts/*.png
