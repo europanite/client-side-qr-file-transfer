@@ -163,6 +163,8 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     assert.equal(await receiver.locator('.qr-box img:visible').count(), 0);
     assert.equal(await receiver.locator('.receiver .preview').count(), 0, 'Receiver must not render a camera screen');
     assert.equal(await receiver.locator('.receiver video.capture-only-video').count(), 1, 'Hidden capture video must remain mounted');
+    assert.equal(await sender.locator('.sender .preview').count(), 0, 'Sender must never render an ACK camera preview');
+    assert.equal(await sender.locator('.sender video.capture-only-video').count(), 1, 'Sender needs a capture-only video element');
     await receiver.getByRole('button', { name: 'Start front camera' }).click();
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
     await receiver.waitForFunction(() => Boolean(window.__e2eCamera));
@@ -212,6 +214,13 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await sender.getByRole('button', { name: 'Stop Sender camera' }).waitFor();
       await sender.waitForFunction(() => Boolean(window.__e2eCamera));
       assert.equal(await sender.locator('.qr-box img:visible').count(), 1, 'Sender must show only the file QR');
+      assert.equal(await sender.locator('.preview').count(), 0, 'A visible ACK camera would display a second QR on Sender');
+      assert.equal(await sender.locator('video.capture-only-video').count(), 1, 'Sender must still decode ACK camera frames');
+      assert.equal(await sender.locator('.sender-ack-status').textContent().then((value) => value.includes('Camera active')), true);
+      assert.equal(await sender.evaluate(() => {
+        const camera = document.querySelector('.sender video.capture-only-video');
+        return camera?.getBoundingClientRect().right < 0 && getComputedStyle(camera).opacity === '0';
+      }), true, 'Sender camera must be off-screen and transparent');
       assert.match(await sender.locator('.sender .stats').textContent(), /Sender ID: [0-9a-f]{12}/);
       assert.equal(await sender.getByRole('button', { name: 'Sender', exact: true }).getAttribute('aria-pressed'), 'true');
       const metaParts = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));

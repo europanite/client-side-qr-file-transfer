@@ -419,7 +419,7 @@ export default function App() {
         <span className="local-badge">100% client-side · QR optical transfer</span>
       </header>
       <div className="intro">
-        Each device displays at most one QR: Sender shows file frames, Receiver shows optical ACKs. Choose a file to switch to Sender and start its ACK camera automatically. Receiver scans the file QR and responds with an ACK QR on the left of its camera.
+        Each device displays one optical QR at most: Sender shows file frames, Receiver shows ACKs. Neither camera preview appears on screen, preventing the opposite device's QR from being displayed twice. Choose a file to start the Sender camera automatically.
       </div>
       <div className="device-controls">
         <div className="toolbar" role="group" aria-label="Device role">
@@ -470,12 +470,13 @@ export default function App() {
               </select>
             </label>}
             {ackCameraError && <p role="alert" className="error">{ackCameraError}</p>}
-            <div className="preview sender-ack-preview" aria-label="Sender ACK camera preview">
-              <video ref={ackVideoRef} muted autoPlay playsInline className="camera-video" />
-              {!ackCameraActive && <div className="preview-overlay">Sender camera is off</div>}
-            </div>
+            {/* ACKs are decoded from camera frames without ever displaying a second QR
+                inside the Sender camera preview. Camera activity is shown as text. */}
+            <video ref={ackVideoRef} muted autoPlay playsInline aria-hidden="true" className="capture-only-video" />
             <canvas ref={ackCanvasRef} className="hidden-canvas" aria-hidden="true" />
-            <div className="line-muted sender-ack-status" aria-live="polite">{ackCameraStatus}</div>
+            <div className="line-muted sender-ack-status" aria-live="polite">
+              {ackCameraActive ? 'Camera active · ' : 'Camera off · '}{ackCameraStatus}
+            </div>
           </div>
           <div className="jump-row">
             <label htmlFor="jump-index">Show chunk #</label>
