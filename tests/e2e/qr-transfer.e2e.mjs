@@ -215,7 +215,8 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await sender.waitForFunction(() => Boolean(window.__e2eCamera));
       assert.equal(await sender.locator('.qr-box img:visible').count(), 1, 'Sender must show only the file QR');
       assert.equal(await sender.locator('.preview').count(), 0, 'A visible ACK camera would display a second QR on Sender');
-      assert.equal(await sender.locator('video.capture-only-video').count(), 1, 'Sender must still decode ACK camera frames');
+      // Both capture videos remain mounted; count only the Sender's off-screen ACK camera.
+      assert.equal(await sender.locator('.sender video.capture-only-video').count(), 1, 'Sender must still decode ACK camera frames');
       assert.equal(await sender.locator('.sender-ack-status').textContent().then((value) => value.includes('Camera active')), true);
       assert.equal(await sender.evaluate(() => {
         const camera = document.querySelector('.sender video.capture-only-video');
