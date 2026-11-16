@@ -158,13 +158,13 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     await receiver.addInitScript(installVirtualCamera);
     await Promise.all([sender.goto(url), receiver.goto(url)]);
     await sender.locator('#source-file').waitFor();
+    // Before selecting a file both devices default to Receiver, so no QR is visible.
+    assert.equal(await sender.locator('.qr-box img:visible').count(), 0);
+    assert.equal(await receiver.locator('.qr-box img:visible').count(), 0);
     await receiver.getByRole('button', { name: 'Start front camera' }).click();
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
     await receiver.waitForFunction(() => Boolean(window.__e2eCamera));
 
-    await sender.getByRole('button', { name: 'Start Sender camera' }).click();
-    await sender.getByRole('button', { name: 'Stop Sender camera' }).waitFor();
-    await sender.waitForFunction(() => Boolean(window.__e2eCamera));
 
     // Only rendered QR bitmaps travel between the two independent browser processes.
     // No application state or raw protocol strings are ever injected into the other browser.
@@ -181,6 +181,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
         const img = document.querySelector('.receiver .ack-qr img');
         return img?.src.startsWith('data:image/png') && img.src !== prior;
       }, previousAckQR, { timeout: 15_000 });
+      assert.equal(await receiver.locator('.qr-box img:visible').count(), 1, 'Receiver must show only the ACK QR');
       const ackPNG = await receiver.locator('.ack-qr img').getAttribute('src');
       assert.ok(ackPNG?.startsWith('data:image/png;base64,'));
       previousAckQR = ackPNG;
@@ -205,6 +206,10 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       });
       await sender.waitForFunction((expected) =>
         document.querySelector('.sender .stats')?.textContent?.includes(`Chunks: ${expected}`), dataParts);
+      await sender.getByRole('button', { name: 'Stop Sender camera' }).waitFor();
+      await sender.waitForFunction(() => Boolean(window.__e2eCamera));
+      assert.equal(await sender.locator('.qr-box img:visible').count(), 1, 'Sender must show only the file QR');
+      assert.equal(await sender.getByRole('button', { name: 'Sender', exact: true }).getAttribute('aria-pressed'), 'true');
       const metaParts = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));
       for (let part = 1; part <= metaParts; part++) {
         await sendAndAcknowledge(`Metadata QR · part ${part} / ${metaParts}`,

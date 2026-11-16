@@ -83,3 +83,10 @@ footer { margin-top:22px; padding-top:20px; border-top:1px solid #42304f; font-s
 .sender-ack-preview { max-width:390px; }
 .sender-ack-status { min-height:24px; }
 @media (max-width:620px) { .receiver-optical-row { grid-template-columns:1fr; } }
+
+/* Each device displays only its selected role: the inactive panel stays mounted for camera refs. */
+.panels.single-panel { grid-template-columns:minmax(0,1fr); }
+.panel[hidden] { display:none; }
+.device-controls { display:flex; align-items:center; flex-wrap:wrap; gap:18px; background:#191423; border:1px solid #483952; border-radius:14px; padding:12px 16px; margin-bottom:18px; }
+.upload-control { display:flex; flex-direction:column; gap:6px; }
+.received-frames { margin:10px 0 0; padding-left:22px; font-size:13px; color:#d0c9da; }

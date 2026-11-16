@@ -10,7 +10,6 @@ import './styles.css';
 
 const REPOSITORY = 'https://github.com/europanite/client-side-qr-file-transfer';
 const QR_RENDER_SIZE = 640;
-const CAMERA_TEST_QR = 'QRF-CAMERA-TEST';
 
 type Reconstructed = { blob: Blob; name: string };
 function readableBytes(size: number): string {
@@ -41,16 +40,12 @@ function useQrImage(value: string | null, size = QR_RENDER_SIZE): { image: strin
   return state.value === value ? { image: state.image, error: state.error } : { image: '', error: '' };
 }
 
-function ReceivedQRCard({ qr, label }: { qr: string; label: string }) {
-  const { image } = useQrImage(qr, 190);
-  return <div className="received-tile">{image ? <img src={image} alt={`Received ${label}`} /> : <div className="thumbnail-loading">Processing…</div>}<span>{label}</span></div>;
-}
-
 export default function App() {
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [senderError, setSenderError] = useState('');
   const [position, setPosition] = useState(0);
-  const [cameraTestMode, setCameraTestMode] = useState(false);
+  // Only one direction is displayed on each device. File selection switches to Sender.
+  const [deviceRole, setDeviceRole] = useState<'sender' | 'receiver'>('receiver');
   const [jumpIndex, setJumpIndex] = useState('1');
   const [metaJumpIndex, setMetaJumpIndex] = useState('1');
   const [receiver, setReceiver] = useState<Receiver>(emptyReceiver);
@@ -90,11 +85,9 @@ export default function App() {
   const metaCount = prepared ? metadataPartCount(prepared) : 0;
   const sequence = useMemo(() => prepared ? buildSequence(prepared.header.total, metadataPartCount(prepared)) : [], [prepared]);
   const currentStep = sequence[position];
-  const currentQR = useMemo(() => cameraTestMode ? CAMERA_TEST_QR :
-    (prepared && currentStep ? encodeStep(prepared, currentStep) : null),
-    [cameraTestMode, prepared, currentStep]);
+  const currentQR = useMemo(() => prepared && currentStep ? encodeStep(prepared, currentStep) : null,
+    [prepared, currentStep]);
   const senderQR = useQrImage(currentQR);
-  const receivedQR = useQrImage(receiver.lastQR);
   const acknowledgementQR = useQrImage(receiver.lastAckQR, 310);
   const missing = useMemo(() => missingIndices(receiver), [receiver]);
   const missingMeta = useMemo(() => missingMetadataIndices(receiver), [receiver]);
@@ -104,7 +97,7 @@ export default function App() {
   useEffect(() => { ackGuardRef.current = null; }, [currentQR]);
 
   const acceptSenderAck = useCallback((raw: string) => {
-    if (!prepared || !currentStep || !currentQR || cameraTestMode || transferFinished) return;
+    if (!prepared || !currentStep || !currentQR || transferFinished) return;
     try {
       const ack = decodeAck(raw);
       const frame = decodeFrame(currentQR);
@@ -124,7 +117,7 @@ export default function App() {
     } catch (error) {
       if (raw.startsWith('QRA1|')) setAckCameraStatus(`Invalid ACK: ${String(error)}`);
     }
-  }, [prepared, currentStep, currentQR, cameraTestMode, transferFinished, position, sequence.length]);
+  }, [prepared, currentStep, currentQR, transferFinished, position, sequence.length]);
 
   senderAckHandlerRef.current = acceptSenderAck;
 
@@ -213,11 +206,6 @@ export default function App() {
   }, []);
 
   const consumeQR = useCallback((text: string) => {
-    if (text === CAMERA_TEST_QR) {
-      setScanStatus('Camera test QR detected successfully');
-      setScanError('');
-      return;
-    }
     try {
       const frame = decodeFrame(text);
       setReceiver((previous) => acceptFrame(previous, frame, text));
@@ -320,7 +308,6 @@ export default function App() {
   }, [scanTick, stopCamera]);
 
   const selectFile = useCallback(async (file: File | undefined) => {
-    setCameraTestMode(false);
     setSenderError('');
     setPrepared(null);
     setPosition(0);
@@ -328,6 +315,11 @@ export default function App() {
     ackGuardRef.current = null;
     setAckCameraStatus('Waiting for Receiver ACK QR');
     if (!file) return;
+    // Request camera access in the same user gesture as selecting a file.
+    // The Sender camera will be ready to read Receiver ACKs without a second click.
+    stopCamera();
+    setDeviceRole('sender');
+    if (!ackStreamRef.current) void startAckCamera(ackCameraId);
     try {
       const next = await prepareFile(file);
       setPrepared(next);
@@ -336,7 +328,7 @@ export default function App() {
     } catch (error) {
       setSenderError(String(error));
     }
-  }, []);
+  }, [stopCamera, startAckCamera, ackCameraId]);
 
   useEffect(() => {
     let alive = true;
@@ -369,7 +361,7 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'metadata' && step.index === num - 1);
-    if (target >= 0) { setCameraTestMode(false); setTransferFinished(false); setPosition(target); setSenderError(''); }
+    if (target >= 0) { setTransferFinished(false); setPosition(target); setSenderError(''); }
   };
   const showChunk = () => {
     if (!prepared) return;
@@ -379,10 +371,9 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'data' && step.index === num - 1);
-    if (target >= 0) { setCameraTestMode(false); setTransferFinished(false); setPosition(target); setSenderError(''); }
+    if (target >= 0) { setTransferFinished(false); setPosition(target); setSenderError(''); }
   };
   const previousFrame = () => {
-    setCameraTestMode(false);
     setTransferFinished(false);
     setPosition((current) => Math.max(current - 1, 0));
   };
@@ -418,13 +409,21 @@ export default function App() {
         <span className="local-badge">100% client-side · QR optical transfer</span>
       </header>
       <div className="intro">
-        On two devices, start both cameras. Receiver displays an ACK QR to the left of its camera preview after accepting each Sender QR. Sender scans this ACK to display the next QR automatically. No server or timing-based advancement.
+        Each device displays at most one QR: Sender shows file frames, Receiver shows optical ACKs. Choose a file to switch to Sender and start its ACK camera automatically. Receiver scans the file QR and responds with an ACK QR on the left of its camera.
       </div>
-      <div className="panels">
-        <section className="panel sender" aria-label="Sender panel">
-          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>Holds each frame until its camera reads the Receiver ACK.</p></div></div>
-          <label className="file-label" htmlFor="source-file">Choose file (maximum 2 MiB)</label>
+      <div className="device-controls">
+        <div className="toolbar" role="group" aria-label="Device role">
+          <button aria-pressed={deviceRole === 'receiver'} className={deviceRole === 'receiver' ? '' : 'secondary-button'} onClick={() => { stopAckCamera(); setDeviceRole('receiver'); }}>Receiver</button>
+          <button aria-pressed={deviceRole === 'sender'} className={deviceRole === 'sender' ? '' : 'secondary-button'} onClick={() => { stopCamera(); setDeviceRole('sender'); }}>Sender</button>
+        </div>
+        <div className="upload-control">
+          <label className="file-label" htmlFor="source-file">Choose file to send (maximum 2 MiB)</label>
           <input id="source-file" type="file" onChange={(event) => { void selectFile(event.currentTarget.files?.[0]); }} />
+        </div>
+      </div>
+      <div className="panels single-panel">
+        <section className="panel sender" aria-label="Sender panel" hidden={deviceRole !== 'sender'}>
+          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>Holds each frame until its camera reads the Receiver ACK.</p></div></div>
           {senderError && <p role="alert" className="error">{senderError}</p>}
           <div className="stats">
             <span>File: <strong>{prepared?.header.name || 'None'}</strong></span>
@@ -433,16 +432,15 @@ export default function App() {
             <span>Bytes per QR: <strong>{CHUNK_BYTES}</strong></span>
           </div>
           <div className="qr-box sender-qr" aria-label="Transmitted QR code">
-            {senderQR.image ? <img src={senderQR.image} alt={cameraTestMode ? 'Camera test QR' : `QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
+            {senderQR.image ? <img src={senderQR.image} alt={`QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
               : <div className="placeholder">{senderQR.error || 'Select a file to display QR codes'}</div>}
           </div>
-          <div className="qr-status">{cameraTestMode ? 'Camera test QR — point the Receiver camera here' : prepared && currentStep ? (currentStep.kind === 'metadata'
+          <div className="qr-status">{prepared && currentStep ? (currentStep.kind === 'metadata'
             ? `Metadata QR · part ${currentStep.index + 1} / ${metaCount}`
             : `Data QR · chunk ${currentStep.index + 1} / ${prepared.header.total}`) : 'No active transfer'}</div>
           <div className="toolbar">
             <button className="secondary-button" disabled={!prepared || position === 0} onClick={previousFrame}>Previous QR</button>
-            <button className="secondary-button" disabled={!prepared} onClick={() => { setCameraTestMode(false); setTransferFinished(false); setPosition(0); }}>Start over</button>
-            <button className="secondary-button" onClick={() => setCameraTestMode((value) => !value)}>{cameraTestMode ? 'Return to transfer' : 'Show camera test QR'}</button>
+            <button className="secondary-button" disabled={!prepared} onClick={() => { setTransferFinished(false); setPosition(0); }}>Start over</button>
           </div>
           <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. {transferFinished ? 'Final ACK received: complete.' : 'Waiting for a matching optical ACK; the QR remains fixed.'}</div>
           <div className="sender-ack-scanner">
@@ -479,7 +477,7 @@ export default function App() {
           </div>
           <p className="small-note">Sender advances only after its camera decodes an ACK matching the currently displayed transfer ID, frame kind, index and CRC. Use Previous or Jump to retry. Both devices need a working camera and screen.</p>
         </section>
-        <section className="panel receiver" aria-label="Receiver panel">
+        <section className="panel receiver" aria-label="Receiver panel" hidden={deviceRole !== 'receiver'}>
           <div className="panel-title"><span className="step-dot purple">2</span><div><h1>Receiver</h1><p>Read QR codes using the front-facing camera.</p></div></div>
           <div className="toolbar">
             <button onClick={() => { if (cameraActive) stopCamera(); else void startCamera(cameraId); }}>{cameraActive ? 'Stop camera' : 'Start front camera'}</button>
@@ -519,7 +517,7 @@ export default function App() {
             <strong>Camera diagnostics</strong>
             <span>Frames analyzed: {scanStats.frames} · QR detections: {scanStats.decoded} · Resolution: {scanStats.size}</span>
             <span>{scanStatus}</span>
-            <span>If frames increase but detections remain zero, hold the Sender test QR steady, improve focus and lighting, or select another camera.</span>
+            <span>If frames increase but detections remain zero, hold the Sender file QR steady, improve focus and lighting, or select another camera.</span>
           </div>
           <div className="progress-label"><span>Received chunks</span><strong>{receiver.received} / {expected ?? '?'}</strong></div>
           <progress max={expected || 1} value={receiver.received} />
@@ -534,15 +532,10 @@ export default function App() {
           {verifyError && <p className="error" role="alert">{verifyError}</p>}
           {fileResult && downloadUrl && <a className="download" href={downloadUrl} download={fileResult.name}>Download verified file ({readableBytes(fileResult.blob.size)})</a>}
           <details className="missing"><summary>Missing QR chunks ({missing.length})</summary><p>{expected === null ? 'Not yet known.' : abbreviateMissing(missing)}</p></details>
-          <h2 className="received-title">Last successfully received QR</h2>
-          <div className="qr-box received-qr">
-            {receivedQR.image ? <img src={receivedQR.image} alt="Regenerated QR code of the last successfully received frame" />
-              : <div className="placeholder">Accepted QR appears here after scanning</div>}
-          </div>
-          <p className="qr-status">{receiver.lastLabel || 'Waiting for a valid QR'}</p>
+          <p className="qr-status">{receiver.lastLabel ? `Last accepted: ${receiver.lastLabel}` : 'Waiting for a valid QR'}</p>
           {!!receiver.history.length && <details className="received-history">
-            <summary>Received QR history (latest {receiver.history.length})</summary>
-            <div className="received-gallery">{receiver.history.map((item, index) => <ReceivedQRCard key={`${item.label}-${index}`} qr={item.qr} label={item.label}/>)}</div>
+            <summary>Received frame history (latest {receiver.history.length})</summary>
+            <ul className="received-frames">{receiver.history.map((item, index) => <li key={`${item.label}-${index}`}>{item.label}</li>)}</ul>
           </details>}
         </section>
       </div>
