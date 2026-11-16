@@ -161,6 +161,8 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     // Before selecting a file both devices default to Receiver, so no QR is visible.
     assert.equal(await sender.locator('.qr-box img:visible').count(), 0);
     assert.equal(await receiver.locator('.qr-box img:visible').count(), 0);
+    assert.equal(await receiver.locator('.receiver .preview').count(), 0, 'Receiver must not render a camera screen');
+    assert.equal(await receiver.locator('.receiver video.capture-only-video').count(), 1, 'Hidden capture video must remain mounted');
     await receiver.getByRole('button', { name: 'Start front camera' }).click();
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
     await receiver.waitForFunction(() => Boolean(window.__e2eCamera));
@@ -182,6 +184,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
         return img?.src.startsWith('data:image/png') && img.src !== prior;
       }, previousAckQR, { timeout: 15_000 });
       assert.equal(await receiver.locator('.qr-box img:visible').count(), 1, 'Receiver must show only the ACK QR');
+      assert.match(await receiver.locator('.receiver .stats').textContent(), /Sender ID: [0-9a-f]{12}/);
       const ackPNG = await receiver.locator('.ack-qr img').getAttribute('src');
       assert.ok(ackPNG?.startsWith('data:image/png;base64,'));
       previousAckQR = ackPNG;
@@ -209,6 +212,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await sender.getByRole('button', { name: 'Stop Sender camera' }).waitFor();
       await sender.waitForFunction(() => Boolean(window.__e2eCamera));
       assert.equal(await sender.locator('.qr-box img:visible').count(), 1, 'Sender must show only the file QR');
+      assert.match(await sender.locator('.sender .stats').textContent(), /Sender ID: [0-9a-f]{12}/);
       assert.equal(await sender.getByRole('button', { name: 'Sender', exact: true }).getAttribute('aria-pressed'), 'true');
       const metaParts = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));
       for (let part = 1; part <= metaParts; part++) {
