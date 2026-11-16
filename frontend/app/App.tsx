@@ -10,7 +10,7 @@ import './styles.css';
 
 const REPOSITORY = 'https://github.com/europanite/client-side-qr-file-transfer';
 const QR_RENDER_SIZE = 640;
-const DEFAULT_INTERVAL_MS = 1400;
+const CAMERA_TEST_QR = 'QRF-CAMERA-TEST';
 
 type Reconstructed = { blob: Blob; name: string };
 function readableBytes(size: number): string {
@@ -23,21 +23,22 @@ function abbreviateMissing(numbers: number[]): string {
   return numbers.slice(0, 80).map((index) => index + 1).join(', ') + (numbers.length > 80 ? ` … and ${numbers.length - 80} more` : '');
 }
 function useQrImage(value: string | null, size = QR_RENDER_SIZE): { image: string; error: string } {
-  const [state, setState] = useState({ image: '', error: '' });
+  // Do not show the previous frame while the next QR image is rendering.
+  const [state, setState] = useState({ value: null as string | null, image: '', error: '' });
   useEffect(() => {
     let active = true;
-    if (!value) { setState({ image: '', error: '' }); return; }
+    if (!value) { setState({ value: null, image: '', error: '' }); return; }
     QRCode.toDataURL(value, {
       errorCorrectionLevel: 'L', margin: 4, width: size,
       color: { dark: '#090909', light: '#ffffff' },
     }).then((image) => {
-      if (active) setState({ image, error: '' });
+      if (active) setState({ value, image, error: '' });
     }).catch((error) => {
-      if (active) setState({ image: '', error: `QR generation failed: ${String(error)}` });
+      if (active) setState({ value, image: '', error: `QR generation failed: ${String(error)}` });
     });
     return () => { active = false; };
   }, [value, size]);
-  return state;
+  return state.value === value ? { image: state.image, error: state.error } : { image: '', error: '' };
 }
 
 function ReceivedQRCard({ qr, label }: { qr: string; label: string }) {
@@ -49,8 +50,7 @@ export default function App() {
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [senderError, setSenderError] = useState('');
   const [position, setPosition] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const [intervalMs, setIntervalMs] = useState(DEFAULT_INTERVAL_MS);
+  const [cameraTestMode, setCameraTestMode] = useState(false);
   const [jumpIndex, setJumpIndex] = useState('1');
   const [metaJumpIndex, setMetaJumpIndex] = useState('1');
   const [receiver, setReceiver] = useState<Receiver>(emptyReceiver);
@@ -62,32 +62,29 @@ export default function App() {
   const [verifyError, setVerifyError] = useState('');
   const [downloadUrl, setDownloadUrl] = useState('');
   const [scanError, setScanError] = useState('');
+  const [scanStatus, setScanStatus] = useState('No camera QR detected yet');
+  const [scanStats, setScanStats] = useState({ frames: 0, decoded: 0, size: '—' });
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const tickRef = useRef<number | null>(null);
   const videoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastTickRef = useRef(0);
+  const lastStatsUpdateRef = useRef(0);
+  const scanStatsRef = useRef({ frames: 0, decoded: 0, size: '—' });
   const isMountedRef = useRef(true);
   const metaCount = prepared ? metadataPartCount(prepared) : 0;
   const sequence = useMemo(() => prepared ? buildSequence(prepared.header.total, metadataPartCount(prepared)) : [], [prepared]);
   const currentStep = sequence[position];
-  const currentQR = useMemo(() => prepared && currentStep ? encodeStep(prepared, currentStep) : null,
-    [prepared, currentStep]);
+  const currentQR = useMemo(() => cameraTestMode ? CAMERA_TEST_QR :
+    (prepared && currentStep ? encodeStep(prepared, currentStep) : null),
+    [cameraTestMode, prepared, currentStep]);
   const senderQR = useQrImage(currentQR);
   const receivedQR = useQrImage(receiver.lastQR);
   const missing = useMemo(() => missingIndices(receiver), [receiver]);
   const missingMeta = useMemo(() => missingMetadataIndices(receiver), [receiver]);
   const complete = isComplete(receiver);
   const expected = receiver.total;
-
-  useEffect(() => {
-    if (!playing || sequence.length === 0) return;
-    const timer = window.setInterval(() => {
-      setPosition((current) => (current + 1) % sequence.length);
-    }, intervalMs);
-    return () => window.clearInterval(timer);
-  }, [playing, intervalMs, sequence.length]);
 
   const stopCamera = useCallback(() => {
     if (tickRef.current !== null) cancelAnimationFrame(tickRef.current);
@@ -107,25 +104,37 @@ export default function App() {
   }, []);
 
   const consumeQR = useCallback((text: string) => {
+    if (text === CAMERA_TEST_QR) {
+      setScanStatus('Camera test QR detected successfully');
+      setScanError('');
+      return;
+    }
     try {
       const frame = decodeFrame(text);
       setReceiver((previous) => acceptFrame(previous, frame, text));
+      setScanStatus(frame.kind === 'metadata'
+        ? `Valid metadata QR detected: ${frame.index + 1} / ${frame.total}`
+        : `Valid data QR detected: ${frame.index + 1} / ${frame.total}`);
       setScanError('');
     } catch (error) {
-      // Ignore unrelated QR codes; report malformed frames from this protocol.
-      if (text.startsWith('QRF2|')) setScanError(String(error));
+      if (text.startsWith('QRF2|')) {
+        setScanStatus('QR detected but transfer frame invalid');
+        setScanError(String(error));
+      } else {
+        setScanStatus('QR detected, but it is not a QRF2 transfer QR');
+      }
     }
   }, []);
 
   const scanTick = useCallback((now: number) => {
     if (!streamRef.current) return;
-    if (now - lastTickRef.current >= 110) {
+    if (now - lastTickRef.current >= 180) {
       lastTickRef.current = now;
       const video = videoRef.current;
       const canvas = videoCanvasRef.current;
       if (video && canvas && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-        // Limit processing to 960 px width to avoid large per-frame allocations.
-        const width = Math.min(960, video.videoWidth);
+        // Use enough pixels for small QR modules while avoiding full-resolution 4K scans.
+        const width = Math.min(1280, video.videoWidth);
         const height = Math.max(1, Math.round(video.videoHeight * width / video.videoWidth));
         if (canvas.width !== width) canvas.width = width;
         if (canvas.height !== height) canvas.height = height;
@@ -134,8 +143,27 @@ export default function App() {
           try {
             ctx.drawImage(video, 0, 0, width, height);
             const image = ctx.getImageData(0, 0, width, height);
-            const detected = jsQR(image.data, width, height, { inversionAttempts: 'attemptBoth' });
-            if (detected) consumeQR(detected.data);
+            scanStatsRef.current.frames += 1;
+            scanStatsRef.current.size = `${video.videoWidth} × ${video.videoHeight}`;
+            // Try the full camera image, then the central portion at native pixel size.
+            // A displayed QR is often small within a laptop webcam's field of view.
+            let detected = jsQR(image.data, width, height, { inversionAttempts: 'attemptBoth' });
+            if (!detected && scanStatsRef.current.frames % 2 === 0) {
+              const cropW = Math.round(width * 0.65);
+              const cropH = Math.round(height * 0.78);
+              const left = Math.round((width - cropW) / 2);
+              const top = Math.round((height - cropH) / 2);
+              const crop = ctx.getImageData(left, top, cropW, cropH);
+              detected = jsQR(crop.data, cropW, cropH, { inversionAttempts: 'attemptBoth' });
+            }
+            if (detected) {
+              scanStatsRef.current.decoded += 1;
+              consumeQR(detected.data);
+            }
+            if (now - lastStatsUpdateRef.current > 600) {
+              lastStatsUpdateRef.current = now;
+              setScanStats({ ...scanStatsRef.current });
+            }
           } catch (error) {
             setCameraError(`Camera frame processing failed: ${String(error)}`);
           }
@@ -148,6 +176,9 @@ export default function App() {
   const startCamera = useCallback(async (deviceId?: string) => {
     stopCamera();
     setCameraError('');
+    setScanStatus('Waiting for camera frames');
+    scanStatsRef.current = { frames: 0, decoded: 0, size: '—' };
+    setScanStats({ ...scanStatsRef.current });
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraError('This browser does not support camera capture. Use HTTPS or localhost.');
       return;
@@ -163,7 +194,8 @@ export default function App() {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      const devices = await navigator.mediaDevices.enumerateDevices();
+      // Device enumeration can fail even after getUserMedia succeeds. Do not stop capture.
+      const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[]);
       if (isMountedRef.current) {
         setCameraNames(devices.filter((device) => device.kind === 'videoinput'));
         setCameraActive(true);
@@ -179,7 +211,7 @@ export default function App() {
   }, [scanTick, stopCamera]);
 
   const selectFile = useCallback(async (file: File | undefined) => {
-    setPlaying(false);
+    setCameraTestMode(false);
     setSenderError('');
     setPrepared(null);
     setPosition(0);
@@ -189,7 +221,6 @@ export default function App() {
       setPrepared(next);
       setJumpIndex('1');
       setMetaJumpIndex('1');
-      setPlaying(true);
     } catch (error) {
       setSenderError(String(error));
     }
@@ -226,7 +257,7 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'metadata' && step.index === num - 1);
-    if (target >= 0) { setPlaying(false); setPosition(target); setSenderError(''); }
+    if (target >= 0) { setCameraTestMode(false); setPosition(target); setSenderError(''); }
   };
   const showChunk = () => {
     if (!prepared) return;
@@ -236,7 +267,15 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'data' && step.index === num - 1);
-    if (target >= 0) { setPlaying(false); setPosition(target); setSenderError(''); }
+    if (target >= 0) { setCameraTestMode(false); setPosition(target); setSenderError(''); }
+  };
+  const nextFrame = () => {
+    setCameraTestMode(false);
+    setPosition((current) => Math.min(current + 1, sequence.length - 1));
+  };
+  const previousFrame = () => {
+    setCameraTestMode(false);
+    setPosition((current) => Math.max(current - 1, 0));
   };
   const scanImage = async (file: File | undefined) => {
     if (!file) return;
@@ -270,11 +309,11 @@ export default function App() {
         <span className="local-badge">100% client-side · QR optical transfer</span>
       </header>
       <div className="intro">
-        Open this same site on two devices. Show the Sender QR codes to the Receiver camera. All file content remains local to the two browsers and the optical path.
+        Open this website on two devices. Keep each Sender QR on screen until the Receiver confirms it, then click Next QR manually. No automatic switching or server transfer.
       </div>
       <div className="panels">
         <section className="panel sender" aria-label="Sender panel">
-          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>Choose a local file, then display frames in order.</p></div></div>
+          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>One QR at a time. Advance only after the Receiver confirms it.</p></div></div>
           <label className="file-label" htmlFor="source-file">Choose file (maximum 2 MiB)</label>
           <input id="source-file" type="file" onChange={(event) => { void selectFile(event.currentTarget.files?.[0]); }} />
           {senderError && <p role="alert" className="error">{senderError}</p>}
@@ -285,20 +324,19 @@ export default function App() {
             <span>Bytes per QR: <strong>{CHUNK_BYTES}</strong></span>
           </div>
           <div className="qr-box sender-qr" aria-label="Transmitted QR code">
-            {senderQR.image ? <img src={senderQR.image} alt={`QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
+            {senderQR.image ? <img src={senderQR.image} alt={cameraTestMode ? 'Camera test QR' : `QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
               : <div className="placeholder">{senderQR.error || 'Select a file to display QR codes'}</div>}
           </div>
-          <div className="qr-status">{prepared && currentStep ? (currentStep.kind === 'metadata'
+          <div className="qr-status">{cameraTestMode ? 'Camera test QR — point the Receiver camera here' : prepared && currentStep ? (currentStep.kind === 'metadata'
             ? `Metadata QR · part ${currentStep.index + 1} / ${metaCount}`
             : `Data QR · chunk ${currentStep.index + 1} / ${prepared.header.total}`) : 'No active transfer'}</div>
           <div className="toolbar">
-            <button disabled={!prepared} onClick={() => setPlaying((prev) => !prev)}>{playing ? 'Pause' : 'Play / Loop'}</button>
-            <button className="secondary-button" disabled={!prepared} onClick={() => { setPlaying(false); setPosition((prev) => (prev - 1 + sequence.length) % sequence.length); }}>Previous</button>
-            <button className="secondary-button" disabled={!prepared} onClick={() => { setPlaying(false); setPosition((prev) => (prev + 1) % sequence.length); }}>Next</button>
+            <button disabled={!prepared || (!cameraTestMode && position === sequence.length - 1)} onClick={nextFrame}>Next QR</button>
+            <button className="secondary-button" disabled={!prepared || (!cameraTestMode && position === 0)} onClick={previousFrame}>Previous QR</button>
+            <button className="secondary-button" disabled={!prepared} onClick={() => { setCameraTestMode(false); setPosition(0); }}>Start over</button>
+            <button className="secondary-button" onClick={() => setCameraTestMode((value) => !value)}>{cameraTestMode ? 'Return to transfer' : 'Show camera test QR'}</button>
           </div>
-          <label className="row-label" htmlFor="interval">Frame interval: <strong>{(intervalMs / 1000).toFixed(1)} seconds</strong></label>
-          <input id="interval" type="range" min="500" max="5000" step="100" value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))}/>
-          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. Small metadata QRs repeat every 64 data chunks; the sequence loops.</div>
+          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. The QR remains fixed until you click Next QR; no auto-loop.</div>
           <div className="jump-row">
             <label htmlFor="jump-index">Show chunk #</label>
             <input id="jump-index" type="number" min="1" max={prepared?.header.total ?? 1} value={jumpIndex} onChange={(e) => setJumpIndex(e.target.value)} />
@@ -309,8 +347,7 @@ export default function App() {
             <input id="metadata-jump-index" type="number" min="1" max={metaCount || 1} value={metaJumpIndex} onChange={(e) => setMetaJumpIndex(e.target.value)} />
             <button className="secondary-button" disabled={!prepared} onClick={showMetadata}>Jump metadata</button>
           </div>
-          <p className="small-note">A camera cannot acknowledge received frames through this one-way channel. Use the missing-chunk list on the Receiver and replay or jump to the missing QR.</p>
-          {prepared && <div className="time-hint">One complete cycle: ~{Math.ceil(sequence.length * intervalMs / 60000)} minutes at the current speed. Small files work best.</div>}
+          <p className="small-note">Watch the Receiver's accepted-frame message before clicking Next QR. A one-way optical link cannot automatically acknowledge a frame; you control advancement manually. You can go back to resend a missing QR.</p>
         </section>
         <section className="panel receiver" aria-label="Receiver panel">
           <div className="panel-title"><span className="step-dot purple">2</span><div><h1>Receiver</h1><p>Read QR codes using the front-facing camera.</p></div></div>
@@ -335,6 +372,12 @@ export default function App() {
           <canvas ref={videoCanvasRef} className="hidden-canvas" aria-hidden="true" />
           <div className="image-fallback"><label htmlFor="qr-image">Or scan a QR screenshot:</label> <input id="qr-image" type="file" accept="image/*" onChange={(event) => { void scanImage(event.currentTarget.files?.[0]); event.currentTarget.value = ''; }}/></div>
           {scanError && <p className="error" role="alert">{scanError}</p>}
+          <div className="scan-debug" role="status" aria-live="polite">
+            <strong>Camera diagnostics</strong>
+            <span>Frames analyzed: {scanStats.frames} · QR detections: {scanStats.decoded} · Resolution: {scanStats.size}</span>
+            <span>{scanStatus}</span>
+            <span>If frames increase but detections remain zero, hold the Sender test QR steady, improve focus and lighting, or select another camera.</span>
+          </div>
           <div className="progress-label"><span>Received chunks</span><strong>{receiver.received} / {expected ?? '?'}</strong></div>
           <progress max={expected || 1} value={receiver.received} />
           <div className="progress-label"><span>Metadata QR parts</span><strong>{Object.keys(receiver.metadata).length} / {receiver.metadataTotal ?? '?'}</strong></div>
