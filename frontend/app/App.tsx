@@ -10,6 +10,16 @@ import './styles.css';
 
 const REPOSITORY = 'https://github.com/europanite/client-side-qr-file-transfer';
 const QR_RENDER_SIZE = 640;
+const SENDER_ID_STORAGE_KEY = 'client-side-qr-file-transfer.sender-id.v1';
+function browserSenderId(): string {
+  let value: string | null = null;
+  try { value = window.localStorage.getItem(SENDER_ID_STORAGE_KEY); } catch { /* private mode */ }
+  if (value && /^[0-9a-f]{12}$/.test(value)) return value;
+  value = Array.from(crypto.getRandomValues(new Uint8Array(6)),
+    (byte) => byte.toString(16).padStart(2, '0')).join('');
+  try { window.localStorage.setItem(SENDER_ID_STORAGE_KEY, value); } catch { /* ephemeral sender ID */ }
+  return value;
+}
 
 type Reconstructed = { blob: Blob; name: string };
 function readableBytes(size: number): string {
@@ -115,7 +125,7 @@ export default function App() {
         setAckCameraStatus(`ACK accepted for ${currentStep.kind} ${currentStep.index + 1}; displaying next QR`);
       }
     } catch (error) {
-      if (raw.startsWith('QRA1|')) setAckCameraStatus(`Invalid ACK: ${String(error)}`);
+      if (raw.startsWith('QRA2|')) setAckCameraStatus(`Invalid ACK: ${String(error)}`);
     }
   }, [prepared, currentStep, currentQR, transferFinished, position, sequence.length]);
 
@@ -214,11 +224,11 @@ export default function App() {
         : `Valid data QR detected: ${frame.index + 1} / ${frame.total}`);
       setScanError('');
     } catch (error) {
-      if (text.startsWith('QRF2|')) {
+      if (text.startsWith('QRF3|')) {
         setScanStatus('QR detected but transfer frame invalid');
         setScanError(String(error));
       } else {
-        setScanStatus('QR detected, but it is not a QRF2 transfer QR');
+        setScanStatus('QR detected, but it is not a QRF3 transfer QR');
       }
     }
   }, []);
@@ -321,7 +331,7 @@ export default function App() {
     setDeviceRole('sender');
     if (!ackStreamRef.current) void startAckCamera(ackCameraId);
     try {
-      const next = await prepareFile(file);
+      const next = await prepareFile(file, browserSenderId());
       setPrepared(next);
       setJumpIndex('1');
       setMetaJumpIndex('1');
@@ -430,6 +440,8 @@ export default function App() {
             <span>Size: <strong>{prepared ? readableBytes(prepared.header.size) : '—'}</strong></span>
             <span>Chunks: <strong>{prepared?.header.total ?? '—'}</strong></span>
             <span>Bytes per QR: <strong>{CHUNK_BYTES}</strong></span>
+            <span>Sender ID: <strong>{prepared?.header.senderId ?? '—'}</strong></span>
+            <span>Transfer ID: <strong>{prepared?.header.id ?? '—'}</strong></span>
           </div>
           <div className="qr-box sender-qr" aria-label="Transmitted QR code">
             {senderQR.image ? <img src={senderQR.image} alt={`QR code: ${currentStep?.kind === 'metadata' ? `metadata part ${(currentStep?.index ?? 0) + 1}` : `chunk ${(currentStep?.index ?? 0) + 1}`}`} />
@@ -475,7 +487,7 @@ export default function App() {
             <input id="metadata-jump-index" type="number" min="1" max={metaCount || 1} value={metaJumpIndex} onChange={(e) => setMetaJumpIndex(e.target.value)} />
             <button className="secondary-button" disabled={!prepared} onClick={showMetadata}>Jump metadata</button>
           </div>
-          <p className="small-note">Sender advances only after its camera decodes an ACK matching the currently displayed transfer ID, frame kind, index and CRC. Use Previous or Jump to retry. Both devices need a working camera and screen.</p>
+          <p className="small-note">Sender advances only after its camera decodes an ACK matching the current sender ID, transfer ID, frame kind, index and CRC. Use Previous or Jump to retry. Both devices need a working camera and screen.</p>
         </section>
         <section className="panel receiver" aria-label="Receiver panel" hidden={deviceRole !== 'receiver'}>
           <div className="panel-title"><span className="step-dot purple">2</span><div><h1>Receiver</h1><p>Read QR codes using the front-facing camera.</p></div></div>
@@ -493,23 +505,16 @@ export default function App() {
             </select>
           </label>}
           {cameraError && <p className="error" role="alert">{cameraError}</p>}
-          <div className="receiver-optical-row">
-            <div className="receiver-ack-column">
-              <h2>Received ACK QR</h2>
-              <div className="qr-box ack-qr" aria-label="Receiver acknowledgement QR">
-                {acknowledgementQR.image ? <img src={acknowledgementQR.image} alt="ACK QR for the last accepted frame" />
-                  : <div className="placeholder">ACK appears after a valid QR is received</div>}
-              </div>
-              <p className="qr-status">{receiver.lastAckLabel ? `ACK: ${receiver.lastAckLabel}` : 'Waiting for a valid frame'}</p>
+          <div className="receiver-ack-column">
+            <h2>Received ACK QR</h2>
+            <div className="qr-box ack-qr" aria-label="Receiver acknowledgement QR">
+              {acknowledgementQR.image ? <img src={acknowledgementQR.image} alt="ACK QR for the last accepted frame" />
+                : <div className="placeholder">ACK appears after a valid QR is received</div>}
             </div>
-            <div className="receiver-camera-column">
-              <h2>Receiver camera</h2>
-              <div className="preview" aria-label="Live receiver camera preview">
-                <video ref={videoRef} muted autoPlay playsInline className="camera-video" />
-                {!cameraActive && <div className="preview-overlay">Camera is off · HTTPS or localhost required</div>}
-              </div>
-            </div>
+            <p className="qr-status">{receiver.lastAckLabel ? `ACK: ${receiver.lastAckLabel}` : 'Waiting for a valid frame'}</p>
           </div>
+          {/* Capture continues without rendering the Receiver camera feed on screen. */}
+          <video ref={videoRef} muted autoPlay playsInline aria-hidden="true" className="capture-only-video" />
           <canvas ref={videoCanvasRef} className="hidden-canvas" aria-hidden="true" />
           <div className="image-fallback"><label htmlFor="qr-image">Or scan a QR screenshot:</label> <input id="qr-image" type="file" accept="image/*" onChange={(event) => { void scanImage(event.currentTarget.files?.[0]); event.currentTarget.value = ''; }}/></div>
           {scanError && <p className="error" role="alert">{scanError}</p>}
@@ -525,6 +530,8 @@ export default function App() {
           {missingMeta.length > 0 && <div className="line-muted">Missing metadata parts: {abbreviateMissing(missingMeta)}</div>}
           <div className="line-muted" aria-live="polite">{receiver.notice}</div>
           <div className="stats">
+            <span>Sender ID: <strong>{receiver.senderId ?? 'Waiting for sender'}</strong></span>
+            <span>Transfer ID: <strong>{receiver.id ?? '—'}</strong></span>
             <span>File: <strong>{receiver.header?.name || 'Waiting for metadata'}</strong></span>
             <span>Size: <strong>{receiver.header ? readableBytes(receiver.header.size) : '—'}</strong></span>
             <span>SHA-256: <strong>{fileResult ? 'Verified' : (complete ? 'Verifying…' : 'Pending')}</strong></span>

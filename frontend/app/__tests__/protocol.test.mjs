@@ -60,15 +60,15 @@ test('CRC tampering is rejected before accepting data or metadata', async () => 
   const prepared = await prepareFile(file('a.bin', new Uint8Array([1, 2, 3])));
   for (const code of [encodeData(prepared, 0), encodeHeader(prepared, 0)]) {
     const parts = code.split('|');
-    parts[5] = '00000000';
+    parts[7] = '00000000';
     assert.throws(() => decodeFrame(parts.join('|')), /checksum mismatch/);
   }
   assert.equal(crc32(new Uint8Array([1, 2, 3])), '55bc801d');
 });
 
 test('competing transfer IDs are rejected', async () => {
-  const first = await prepareFile(file('first.bin', new Uint8Array([1])));
-  const second = await prepareFile(file('second.bin', new Uint8Array([2])));
+  const first = await prepareFile(file('first.bin', new Uint8Array([1])), 'abcdef012345');
+  const second = await prepareFile(file('second.bin', new Uint8Array([2])), 'abcdef012345');
   const state = scan(scanMetadata(first), encodeData(second, 0));
   assert.equal(state.received, 0);
   assert.match(state.notice, /Different transfer/);
@@ -80,7 +80,7 @@ test('metadata repeats periodically without dense full-size header QR', async ()
   const steps = buildSequence(prepared.header.total, parts);
   assert.equal(steps.filter((s) => s.kind === 'metadata').length, parts * 2);
   assert.equal(steps.filter((s) => s.kind === 'data').length, HEADER_INTERVAL + 1);
-  assert.ok(encodeStep(prepared, steps[0]).startsWith(`${MAGIC}|M|`));
+  assert.ok(encodeStep(prepared, steps[0]).startsWith(`${MAGIC}|S|${prepared.header.senderId}|M|`));
   assert.equal(encodeStep(prepared, steps.at(-1)), encodeData(prepared, HEADER_INTERVAL));
 });
 
@@ -90,7 +90,7 @@ test('each QR stays short even for the maximum Unicode filename', async () => {
   assert.equal(META_BYTES, 48);
   for (const frame of buildSequence(prepared.header.total, metadataPartCount(prepared))) {
     const qr = encodeStep(prepared, frame);
-    assert.ok(qr.length <= 115, `Oversized QR: ${qr.length}`);
+    assert.ok(qr.length <= 145, `Oversized QR: ${qr.length}`);
     assert.deepEqual(decodeFrame(qr).kind, frame.kind);
   }
 });
@@ -108,10 +108,11 @@ test('file digest mismatch blocks reconstruction', async () => {
 });
 
 test('rejects malformed or outdated QRs', async () => {
-  assert.throws(() => decodeFrame('irrelevant'), /Not a QRF2/);
-  assert.throws(() => decodeFrame('QRF1|D|0123456789ab|0|1|00000000|AA'), /Not a QRF2/);
-  assert.throws(() => decodeFrame('QRF2|D|123|0|1|00000000|a'), /Invalid transfer ID/);
-  assert.throws(() => decodeFrame('QRF2|D|0123456789ab|0|1|00000000|*'), /Invalid base64url/);
+  assert.throws(() => decodeFrame('irrelevant'), /Not a QRF3/);
+  assert.throws(() => decodeFrame('QRF2|D|0123456789ab|0|1|00000000|AA'), /Not a QRF3/);
+  assert.throws(() => decodeFrame('QRF3|S|not-an-id|D|0123456789ab|0|1|00000000|AA'), /Invalid sender ID/);
+  assert.throws(() => decodeFrame('QRF3|S|123456789abc|D|not-an-id|0|1|00000000|AA'), /Invalid transfer ID/);
+  assert.throws(() => decodeFrame('QRF3|S|123456789abc|D|0123456789ab|0|1|00000000|*'), /Invalid base64url/);
 });
 
 
@@ -126,8 +127,8 @@ test('ACK QR matches only the exact transfer ID, frame kind, number and CRC', as
   assert.equal(ackMatchesFrame(ack, decodeFrame(encodeHeader(prepared, 0))), false);
   const second = await prepareFile(file('ack.bin', new Uint8Array(CHUNK_BYTES + 1).fill(123)));
   assert.equal(ackMatchesFrame(ack, decodeFrame(encodeData(second, 0))), false);
-  assert.throws(() => decodeAck('QRA1|not-an-id|D|0|2|00000000'), /Invalid ACK transfer ID/);
-  assert.throws(() => decodeAck('QRA1|0123456789ab|D|2|2|00000000'), /Integer out of bounds/);
+  assert.throws(() => decodeAck('QRA2|S|123456789abc|not-an-id|D|0|2|00000000'), /Invalid ACK transfer ID/);
+  assert.throws(() => decodeAck('QRA2|S|123456789abc|0123456789ab|D|2|2|00000000'), /Integer out of bounds/);
 });
 
 test('Receiver shows ACK for accepted frames and retransmits ACK for duplicates', async () => {
@@ -142,4 +143,41 @@ test('Receiver shows ACK for accepted frames and retransmits ACK for duplicates'
   receiver = acceptFrame(receiver, frame, first);
   assert.equal(receiver.lastAckQR, encodeAck(frame));
   assert.equal(receiver.received, 1);
+});
+
+test('sender header persists across frames and rejects mixed sources', async () => {
+  const sender = '0123456789ab';
+  const fileA = await prepareFile(file('origin.bin', new Uint8Array(CHUNK_BYTES + 2).fill(42)), sender);
+  const first = encodeData(fileA, 0);
+  const decoded = decodeFrame(first);
+  assert.equal(decoded.senderId, sender);
+  assert.equal(first.split('|')[1], 'S');
+  let receiver = scan(emptyReceiver(), first);
+  assert.equal(receiver.senderId, sender);
+  assert.equal(receiver.received, 1);
+  // A header edit is not covered by the payload's old CRC alone: QRF3 rejects it.
+  const edited = first.split('|');
+  edited[2] = 'fedcba987654';
+  assert.throws(() => decodeFrame(edited.join('|')), /checksum mismatch/);
+  const anotherSender = await prepareFile(file('other.bin', new Uint8Array([8])), 'fedcba987654');
+  // A valid QR from another origin with the same transfer ID stays isolated.
+
+  anotherSender.header.id = fileA.header.id;
+  const otherValid = encodeData(anotherSender, 0);
+  receiver = scan(receiver, otherValid);
+  assert.equal(receiver.received, 1);
+  assert.match(receiver.notice, /Different sender/);
+  const ack = decodeAck(encodeAck(decoded));
+  assert.equal(ack.senderId, sender);
+  assert.equal(ackMatchesFrame(ack, decodeFrame(otherValid)), false);
+});
+
+test('metadata sender header matches every frame and reconstructed metadata', async () => {
+  const sender = '001122334455';
+  const prepared = await prepareFile(file('bound.bin', new Uint8Array([2, 3])), sender);
+  let state = scanMetadata(prepared);
+  assert.equal(state.header.senderId, sender);
+  assert.equal(state.senderId, sender);
+  state = scan(state, encodeData(prepared, 0));
+  assert.deepEqual(new Uint8Array(await (await assemble(state)).blob.arrayBuffer()), new Uint8Array([2, 3]));
 });
