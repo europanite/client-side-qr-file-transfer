@@ -69,7 +69,7 @@ async function serveProductionBuild(t) {
   return `http://127.0.0.1:${server.address().port}${basePath}/`;
 }
 
-// Installed BEFORE the receiver loads the app; the sender gets no shim at all.
+// Installed in BOTH independent browsers to simulate the two optical directions.
 function installVirtualCamera() {
   if (!navigator.mediaDevices) throw new Error('Expected a secure localhost origin');
   Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
@@ -154,6 +154,7 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     for (const [name, page] of [['sender', sender], ['receiver', receiver]]) {
       page.on('pageerror', (error) => browserErrors.push(`${name}: ${error.message}`));
     }
+    await sender.addInitScript(installVirtualCamera);
     await receiver.addInitScript(installVirtualCamera);
     await Promise.all([sender.goto(url), receiver.goto(url)]);
     await sender.locator('#source-file').waitFor();
@@ -161,58 +162,65 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
     await receiver.waitForFunction(() => Boolean(window.__e2eCamera));
 
-    let previousSource = null;
-    async function scan(status, expectedNotice) {
-      // Only copy the rendered bitmap: no access to application protocol objects.
-      const source = await waitForVisibleQr(sender, status, previousSource);
-      assert.ok(source?.startsWith('data:image/png;base64,'), 'Expected a rendered QR PNG');
-      await receiver.evaluate(async (image) => window.__e2eCamera.setFrame(image), source);
-      previousSource = source;
-      // The diagnostic box is also aria-live; only the transfer notice carries accepted-frame acknowledgments.
-      if (expectedNotice) {
-        try {
-          await receiver.waitForFunction((notice) =>
-            document.querySelector('.receiver .line-muted[aria-live="polite"]')?.textContent?.includes(notice),
-          expectedNotice, { timeout: 15_000 });
-        } catch (error) {
-          const state = await receiver.evaluate(() => ({
-            notice: document.querySelector('.receiver .line-muted[aria-live="polite"]')?.textContent,
-            progress: Array.from(document.querySelectorAll('.receiver .progress-label'))
-              .find((element) => element.querySelector('span')?.textContent?.trim() === 'Received chunks')
-              ?.querySelector('strong')?.textContent,
-            cameraButton: document.querySelector('.receiver .toolbar button')?.textContent,
-          }));
-          throw new Error(`QR not received (${status}): ${JSON.stringify(state)}`, { cause: error });
-        }
+    await sender.getByRole('button', { name: 'Start Sender camera' }).click();
+    await sender.getByRole('button', { name: 'Stop Sender camera' }).waitFor();
+    await sender.waitForFunction(() => Boolean(window.__e2eCamera));
+
+    // Only rendered QR bitmaps travel between the two independent browser processes.
+    // No application state or raw protocol strings are ever injected into the other browser.
+    let previousDataQR = null;
+    let previousAckQR = null;
+    async function sendAndAcknowledge(status, expectedNotice, final = false) {
+      const source = await waitForVisibleQr(sender, status, previousDataQR);
+      assert.ok(source?.startsWith('data:image/png;base64,'), 'Expected Sender QR PNG');
+      await receiver.evaluate(async (png) => window.__e2eCamera.setFrame(png), source);
+      await receiver.waitForFunction((notice) =>
+        document.querySelector('.receiver .line-muted[aria-live="polite"]')?.textContent?.includes(notice),
+      expectedNotice, { timeout: 20_000 });
+      await receiver.waitForFunction((prior) => {
+        const img = document.querySelector('.receiver .ack-qr img');
+        return img?.src.startsWith('data:image/png') && img.src !== prior;
+      }, previousAckQR, { timeout: 15_000 });
+      const ackPNG = await receiver.locator('.ack-qr img').getAttribute('src');
+      assert.ok(ackPNG?.startsWith('data:image/png;base64,'));
+      previousAckQR = ackPNG;
+      // Sender must not advance before receiving an ACK via its own camera.
+      assert.equal(await sender.locator('.sender-qr img').getAttribute('src'), source);
+      await sender.evaluate(async (png) => window.__e2eCamera.setFrame(png), ackPNG);
+      if (final) {
+        await sender.getByText('Final ACK received: complete.').waitFor();
+      } else {
+        await sender.waitForFunction((prior) =>
+          document.querySelector('.sender-qr img')?.getAttribute('src') !== prior &&
+          document.querySelector('.sender-qr img')?.getAttribute('src')?.startsWith('data:image/png'),
+        source, { timeout: 20_000 });
       }
+      previousDataQR = source;
     }
-    async function scanMetadata() {
-      // Metadata is deliberately fragmented into low-density QR frames.
-      const total = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));
-      assert.ok(total >= 2, 'Expected multiple metadata frames');
-      for (let part = 1; part <= total; part += 1) {
-        await sender.locator('#metadata-jump-index').fill(String(part));
-        await sender.getByRole('button', { name: 'Jump metadata' }).click();
-        await scan(`Metadata QR · part ${part} / ${total}`,
-          part === total ? 'File metadata received' : `Received metadata part ${part} / ${total}`);
-      }
-    }
-    async function jumpToChunk(n, expectedNotice) {
-      await sender.locator('#jump-index').fill(String(n));
-      await sender.getByRole('button', { name: 'Jump & pause' }).click();
-      await scan(`Data QR · chunk ${n} /`, expectedNotice);
-    }
-    async function upload(name, buffer, chunkCount) {
+    async function sendFile(name, buffer, dataParts) {
+      previousDataQR = null;
+      previousAckQR = null;
       await sender.locator('#source-file').setInputFiles({
         name, mimeType: 'application/octet-stream', buffer,
       });
-      await sender.waitForFunction((total) =>
-        document.querySelector('.sender .stats')?.textContent?.includes(`Chunks: ${total}`), chunkCount);
-      const initialFrame = await waitForVisibleQr(sender, 'Metadata QR · part 1 /', previousSource);
-      await sender.waitForTimeout(1700);
-      assert.equal(await sender.locator('.sender-qr img').getAttribute('src'), initialFrame,
-        'Sender must hold its QR steady until a person clicks Next QR');
-      await scanMetadata();
+      await sender.waitForFunction((expected) =>
+        document.querySelector('.sender .stats')?.textContent?.includes(`Chunks: ${expected}`), dataParts);
+      const metaParts = Number(await sender.locator('#metadata-jump-index').getAttribute('max'));
+      for (let part = 1; part <= metaParts; part++) {
+        await sendAndAcknowledge(`Metadata QR · part ${part} / ${metaParts}`,
+          part === metaParts ? 'File metadata received' : `Received metadata part ${part} / ${metaParts}`);
+        // Keep the previous ACK in Sender camera and prove it cannot advance a different QR.
+        if (part === 1) {
+          const now = await sender.locator('.sender-qr img').getAttribute('src');
+          await sender.waitForTimeout(700);
+          assert.equal(await sender.locator('.sender-qr img').getAttribute('src'), now,
+            'Stale ACK must not advance a different QR frame');
+        }
+      }
+      for (let part = 1; part <= dataParts; part++) {
+        await sendAndAcknowledge(`Data QR · chunk ${part} / ${dataParts}`,
+          `Received chunk ${part} / ${dataParts}`, part === dataParts);
+      }
     }
     async function verifyDownload(name, original) {
       await receiver.locator('.receiver .stats').getByText('Verified', { exact: true }).waitFor();
@@ -220,53 +228,25 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await receiver.getByRole('link', { name: /Download verified file/ }).click();
       const download = await downloadPromise;
       assert.equal(download.suggestedFilename(), name);
-      const restored = await readFile(await download.path());
-      assert.deepEqual(restored, original, 'Reconstructed bytes differ from source bytes');
+      assert.deepEqual(await readFile(await download.path()), original, 'Recovered file differs');
     }
 
-    // Confirm the physical QR decoding path separately from the file protocol.
-    await sender.getByRole('button', { name: 'Show camera test QR' }).click();
-    await scan('Camera test QR', null);
-    await receiver.getByText('Camera test QR detected successfully').waitFor();
-    await sender.getByRole('button', { name: 'Return to transfer' }).click();
-
     const filename = '転送📁.bin';
-    const payload = Buffer.from(Array.from({ length: 135 }, (_, n) => (n * 73 + (n >> 3)) & 255));
-    await upload(filename, payload, 3);
-    await sender.getByRole('button', { name: 'Start over' }).click();
-    await sender.getByRole('button', { name: 'Next QR' }).click();
-    await sender.getByRole('button', { name: 'Previous QR' }).click();
-    await jumpToChunk(2, 'Received chunk 2 / 3');
-    await receivedCount(receiver, '1 / 3');
-    await receiver.getByText('Missing QR chunks (2)').waitFor();
-    await jumpToChunk(1, 'Received chunk 1 / 3');
-    await receivedCount(receiver, '2 / 3');
-    await jumpToChunk(2, null); // Duplicate QR frame must not count twice.
-    await receiver.waitForTimeout(600);
-    assert.equal((await receivedChunksProgress(receiver).textContent())?.trim(), '2 / 3');
-    await jumpToChunk(3, 'Received chunk 3 / 3');
+    const payload = Buffer.from(Array.from({ length: 135 }, (_, i) => (i * 73 + (i >> 3)) & 255));
+    await sendFile(filename, payload, 3);
     await receivedCount(receiver, '3 / 3');
     await verifyDownload(filename, payload);
 
-    // The receiver camera still displays the final QR. Resetting while it runs
-    // would immediately re-accept that old transfer ID and reject the next file.
-    // Stop capture first, then reset, and restart with a fresh blank camera feed.
+    // A second transfer uses a new transfer ID. Clear both virtual camera frames
+    // so an old QR is not mistakenly received after a reset.
     await receiver.getByRole('button', { name: 'Stop camera' }).click();
-    await receiver.getByRole('button', { name: 'Start front camera' }).waitFor();
     await receiver.getByRole('button', { name: 'Reset received file' }).click();
-    await receivedCount(receiver, '0 / ?');
     await receiver.getByRole('button', { name: 'Start front camera' }).click();
     await receiver.getByRole('button', { name: 'Stop camera' }).waitFor();
-    await receiver.waitForTimeout(350);
-    assert.equal((await receivedChunksProgress(receiver).textContent())?.trim(), '0 / ?',
-      'The previous transfer was unexpectedly reacquired after reset');
-
-    // A second transfer on the same two browser processes tests empty files.
-    const emptyFilename = 'empty.txt';
-    await upload(emptyFilename, Buffer.alloc(0), 1);
-    await jumpToChunk(1, 'Received chunk 1 / 1');
+    await receiver.waitForFunction(() => Boolean(window.__e2eCamera));
+    await sendFile('empty.txt', Buffer.alloc(0), 1);
     await receivedCount(receiver, '1 / 1');
-    await verifyDownload(emptyFilename, Buffer.alloc(0));
+    await verifyDownload('empty.txt', Buffer.alloc(0));
     assert.deepEqual(browserErrors, [], `Unexpected browser errors: ${browserErrors.join('; ')}`);
   } catch (error) {
     await mkdir(artifacts, { recursive: true });

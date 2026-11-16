@@ -20,6 +20,35 @@ export type DataFrame = {
   kind: 'data'; id: string; index: number; total: number; bytes: Uint8Array;
 };
 export type Frame = MetadataFrame | DataFrame;
+export type AckFrame = {
+  id: string; kind: 'metadata' | 'data'; index: number; total: number; crc: string;
+};
+// ACKs are deliberately short QR codes: QRA1|transfer-id|M/D|index|total|crc32.
+// This CRC is a frame fingerprint, not a security/authentication mechanism.
+export const ACK_MAGIC = 'QRA1';
+
+export function encodeAck(frame: Frame): string {
+  return [ACK_MAGIC, frame.id, frame.kind === 'metadata' ? 'M' : 'D',
+    frame.index, frame.total, crc32(frame.bytes)].join('|');
+}
+export function decodeAck(raw: string): AckFrame {
+  assert(raw.length <= 90, 'ACK QR too large');
+  const parts = raw.split('|');
+  assert(parts.length === 6 && parts[0] === ACK_MAGIC, 'Not a QRA1 acknowledgement');
+  assert(/^[0-9a-f]{12}$/.test(parts[1]), 'Invalid ACK transfer ID');
+  assert(parts[2] === 'M' || parts[2] === 'D', 'Invalid ACK kind');
+  const limit = parts[2] === 'M' ? MAX_METADATA_PARTS : Math.ceil(MAX_FILE_BYTES / CHUNK_BYTES);
+  const total = parseInteger(parts[4], 1, limit);
+  const index = parseInteger(parts[3], 0, total - 1);
+  assert(/^[0-9a-f]{8}$/.test(parts[5]), 'Invalid ACK CRC');
+  return { id: parts[1], kind: parts[2] === 'M' ? 'metadata' : 'data',
+    index, total, crc: parts[5] };
+}
+export function ackMatchesFrame(ack: AckFrame, frame: Frame): boolean {
+  return ack.id === frame.id && ack.kind === frame.kind &&
+    ack.index === frame.index && ack.total === frame.total &&
+    ack.crc === crc32(frame.bytes);
+}
 export type FrameStep = { kind: 'metadata'; index: number } | { kind: 'data'; index: number };
 export type Prepared = { header: HeaderFrame; bytes: Uint8Array; metadata: Uint8Array };
 export type Receiver = {
@@ -27,6 +56,7 @@ export type Receiver = {
   metadata: Record<number, Uint8Array>; metadataTotal: number | null;
   chunks: Record<number, Uint8Array>; received: number;
   lastQR: string | null; lastLabel: string | null;
+  lastAckQR: string | null; lastAckLabel: string | null;
   history: { qr: string; label: string }[];
   notice: string;
 };
@@ -34,7 +64,8 @@ export type Receiver = {
 export const emptyReceiver = (): Receiver => ({
   id: null, total: null, header: null, metadata: {}, metadataTotal: null,
   chunks: {}, received: 0,
-  lastQR: null, lastLabel: null, history: [], notice: 'Ready for QR codes',
+  lastQR: null, lastLabel: null, lastAckQR: null, lastAckLabel: null,
+  history: [], notice: 'Ready for QR codes',
 });
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -182,9 +213,16 @@ function parseHeader(state: Receiver): HeaderFrame {
     sha256: sha, name: safeFilename(name), mime: mime || 'application/octet-stream',
   };
 }
-function remember(state: Receiver, raw: string, label: string, notice: string): Receiver {
+function remember(state: Receiver, frame: Frame, raw: string, label: string, notice: string): Receiver {
   return { ...state, lastQR: raw, lastLabel: label,
+    lastAckQR: encodeAck(frame), lastAckLabel: label,
     history: [...state.history.slice(-7), { qr: raw, label }], notice };
+}
+function repeatAcknowledgement(state: Receiver, frame: Frame): Receiver {
+  // Return an ACK for duplicate frames: a sender may have missed the first ACK.
+  const lastAckQR = encodeAck(frame);
+  if (state.lastAckQR === lastAckQR) return state;
+  return { ...state, lastAckQR, lastAckLabel: `${frame.kind === 'metadata' ? 'Metadata' : 'Chunk'} ${frame.index + 1} / ${frame.total}` };
 }
 export function acceptFrame(state: Receiver, frame: Frame, raw: string): Receiver {
   if (state.id && state.id !== frame.id) {
@@ -194,21 +232,27 @@ export function acceptFrame(state: Receiver, frame: Frame, raw: string): Receive
     if (state.metadataTotal !== null && state.metadataTotal !== frame.total) {
       return { ...state, notice: 'Conflicting metadata part count; ignored.' };
     }
-    if (state.metadata[frame.index]) return state;
+    if (state.metadata[frame.index]) {
+      // Do not ACK a complete-but-invalid metadata block on subsequent scans.
+      if (!state.header && state.metadataTotal !== null &&
+          Object.keys(state.metadata).length === state.metadataTotal) return state;
+      return crc32(state.metadata[frame.index]) === crc32(frame.bytes)
+        ? repeatAcknowledgement(state, frame) : { ...state, notice: 'Conflicting metadata part; ignored.' };
+    }
     const next: Receiver = {
       ...state, id: frame.id, metadataTotal: frame.total,
       metadata: { ...state.metadata, [frame.index]: frame.bytes },
     };
     const label = `Metadata ${frame.index + 1} / ${frame.total}`;
     if (Object.keys(next.metadata).length !== frame.total) {
-      return remember(next, raw, label, `Received metadata part ${frame.index + 1} / ${frame.total}`);
+      return remember(next, frame, raw, label, `Received metadata part ${frame.index + 1} / ${frame.total}`);
     }
     try {
       const header = parseHeader(next);
       if (next.total !== null && next.total !== header.total) {
         return { ...next, notice: 'Conflicting metadata/data frame count; ignored.' };
       }
-      return remember({ ...next, total: header.total, header }, raw, label, 'File metadata received');
+      return remember({ ...next, total: header.total, header }, frame, raw, label, 'File metadata received');
     } catch (error) {
       return { ...next, notice: `Invalid metadata: ${String(error)}` };
     }
@@ -216,10 +260,13 @@ export function acceptFrame(state: Receiver, frame: Frame, raw: string): Receive
   if (state.total !== null && state.total !== frame.total) {
     return { ...state, notice: 'Conflicting frame count; ignored.' };
   }
-  if (state.chunks[frame.index]) return state;
+  if (state.chunks[frame.index]) {
+    return crc32(state.chunks[frame.index]) === crc32(frame.bytes)
+      ? repeatAcknowledgement(state, frame) : { ...state, notice: 'Conflicting chunk; ignored.' };
+  }
   return remember({ ...state, id: frame.id, total: frame.total,
     chunks: { ...state.chunks, [frame.index]: frame.bytes }, received: state.received + 1,
-  }, raw, `Chunk ${frame.index + 1} / ${frame.total}`,
+  }, frame, raw, `Chunk ${frame.index + 1} / ${frame.total}`,
   `Received chunk ${frame.index + 1} / ${frame.total}`);
 }
 export function missingIndices(state: Receiver): number[] {

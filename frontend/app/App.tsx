@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import {
-  acceptFrame, assemble, buildSequence, decodeFrame, emptyReceiver,
+  acceptFrame, ackMatchesFrame, assemble, buildSequence, decodeAck, decodeFrame, emptyReceiver,
   encodeStep, isComplete, CHUNK_BYTES, metadataPartCount, missingIndices, missingMetadataIndices, prepareFile,
   type Prepared, type Receiver,
 } from './src/protocol';
@@ -64,6 +64,12 @@ export default function App() {
   const [scanError, setScanError] = useState('');
   const [scanStatus, setScanStatus] = useState('No camera QR detected yet');
   const [scanStats, setScanStats] = useState({ frames: 0, decoded: 0, size: '—' });
+  const [ackCameraActive, setAckCameraActive] = useState(false);
+  const [ackCameraError, setAckCameraError] = useState('');
+  const [ackCameraStatus, setAckCameraStatus] = useState('Start the Sender camera to scan Receiver ACK QR');
+  const [ackCameraNames, setAckCameraNames] = useState<MediaDeviceInfo[]>([]);
+  const [ackCameraId, setAckCameraId] = useState('');
+  const [transferFinished, setTransferFinished] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -73,6 +79,14 @@ export default function App() {
   const lastStatsUpdateRef = useRef(0);
   const scanStatsRef = useRef({ frames: 0, decoded: 0, size: '—' });
   const isMountedRef = useRef(true);
+  const ackVideoRef = useRef<HTMLVideoElement | null>(null);
+  const ackStreamRef = useRef<MediaStream | null>(null);
+  const ackCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ackTickRef = useRef<number | null>(null);
+  const ackLastScanRef = useRef(0);
+  const ackGuardRef = useRef<string | null>(null);
+  // Keep the camera loop on the latest React state even if started before file selection.
+  const senderAckHandlerRef = useRef<(raw: string) => void>(() => {});
   const metaCount = prepared ? metadataPartCount(prepared) : 0;
   const sequence = useMemo(() => prepared ? buildSequence(prepared.header.total, metadataPartCount(prepared)) : [], [prepared]);
   const currentStep = sequence[position];
@@ -81,10 +95,103 @@ export default function App() {
     [cameraTestMode, prepared, currentStep]);
   const senderQR = useQrImage(currentQR);
   const receivedQR = useQrImage(receiver.lastQR);
+  const acknowledgementQR = useQrImage(receiver.lastAckQR, 310);
   const missing = useMemo(() => missingIndices(receiver), [receiver]);
   const missingMeta = useMemo(() => missingMetadataIndices(receiver), [receiver]);
   const complete = isComplete(receiver);
   const expected = receiver.total;
+  // Acknowledgements apply only to the QR currently displayed, not to previous frames.
+  useEffect(() => { ackGuardRef.current = null; }, [currentQR]);
+
+  const acceptSenderAck = useCallback((raw: string) => {
+    if (!prepared || !currentStep || !currentQR || cameraTestMode || transferFinished) return;
+    try {
+      const ack = decodeAck(raw);
+      const frame = decodeFrame(currentQR);
+      if (!ackMatchesFrame(ack, frame)) {
+        setAckCameraStatus('ACK for a different or previous QR ignored');
+        return;
+      }
+      if (ackGuardRef.current === currentQR) return;
+      ackGuardRef.current = currentQR;
+      if (position === sequence.length - 1) {
+        setTransferFinished(true);
+        setAckCameraStatus('Final QR acknowledged — transfer complete');
+      } else {
+        setPosition((old) => Math.min(old + 1, sequence.length - 1));
+        setAckCameraStatus(`ACK accepted for ${currentStep.kind} ${currentStep.index + 1}; displaying next QR`);
+      }
+    } catch (error) {
+      if (raw.startsWith('QRA1|')) setAckCameraStatus(`Invalid ACK: ${String(error)}`);
+    }
+  }, [prepared, currentStep, currentQR, cameraTestMode, transferFinished, position, sequence.length]);
+
+  senderAckHandlerRef.current = acceptSenderAck;
+
+  const scanSenderAck = useCallback((now: number) => {
+    if (!ackStreamRef.current) return;
+    if (now - ackLastScanRef.current >= 180) {
+      ackLastScanRef.current = now;
+      const video = ackVideoRef.current;
+      const canvas = ackCanvasRef.current;
+      if (video && canvas && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth) {
+        const width = Math.min(1280, video.videoWidth);
+        const height = Math.max(1, Math.round(video.videoHeight * width / video.videoWidth));
+        if (canvas.width !== width) canvas.width = width;
+        if (canvas.height !== height) canvas.height = height;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (ctx) try {
+          ctx.drawImage(video, 0, 0, width, height);
+          const data = ctx.getImageData(0, 0, width, height);
+          const detected = jsQR(data.data, width, height, { inversionAttempts: 'attemptBoth' });
+          if (detected) senderAckHandlerRef.current(detected.data);
+        } catch (error) { setAckCameraError(`ACK camera processing failed: ${String(error)}`); }
+      }
+    }
+    ackTickRef.current = requestAnimationFrame(scanSenderAck);
+  }, []);
+
+  const stopAckCamera = useCallback(() => {
+    if (ackTickRef.current !== null) cancelAnimationFrame(ackTickRef.current);
+    ackTickRef.current = null;
+    ackStreamRef.current?.getTracks().forEach((track) => track.stop());
+    ackStreamRef.current = null;
+    if (ackVideoRef.current) ackVideoRef.current.srcObject = null;
+    setAckCameraActive(false);
+  }, []);
+  const startAckCamera = useCallback(async (deviceId?: string) => {
+    stopAckCamera();
+    setAckCameraError('');
+    setAckCameraStatus('Waiting for Receiver ACK QR');
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setAckCameraError('Camera access requires HTTPS or localhost.');
+      return;
+    }
+    try {
+      const video: MediaStreamConstraints['video'] = deviceId
+        ? { deviceId: { exact: deviceId } }
+        : { facingMode: { ideal: 'user' }, width: { ideal: 1280 }, height: { ideal: 720 } };
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
+      if (!isMountedRef.current) { stream.getTracks().forEach((track) => track.stop()); return; }
+      ackStreamRef.current = stream;
+      if (ackVideoRef.current) {
+        ackVideoRef.current.srcObject = stream;
+        await ackVideoRef.current.play();
+      }
+      const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[]);
+      if (isMountedRef.current) {
+        setAckCameraNames(devices.filter((item) => item.kind === 'videoinput'));
+        setAckCameraActive(true);
+        ackLastScanRef.current = 0;
+        ackTickRef.current = requestAnimationFrame(scanSenderAck);
+      }
+    } catch (error) {
+      ackStreamRef.current?.getTracks().forEach((track) => track.stop());
+      ackStreamRef.current = null;
+      setAckCameraActive(false);
+      setAckCameraError(`Could not start Sender camera: ${String(error)}`);
+    }
+  }, [scanSenderAck, stopAckCamera]);
 
   const stopCamera = useCallback(() => {
     if (tickRef.current !== null) cancelAnimationFrame(tickRef.current);
@@ -100,6 +207,8 @@ export default function App() {
       isMountedRef.current = false;
       if (tickRef.current !== null) cancelAnimationFrame(tickRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      if (ackTickRef.current !== null) cancelAnimationFrame(ackTickRef.current);
+      ackStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
@@ -215,6 +324,9 @@ export default function App() {
     setSenderError('');
     setPrepared(null);
     setPosition(0);
+    setTransferFinished(false);
+    ackGuardRef.current = null;
+    setAckCameraStatus('Waiting for Receiver ACK QR');
     if (!file) return;
     try {
       const next = await prepareFile(file);
@@ -257,7 +369,7 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'metadata' && step.index === num - 1);
-    if (target >= 0) { setCameraTestMode(false); setPosition(target); setSenderError(''); }
+    if (target >= 0) { setCameraTestMode(false); setTransferFinished(false); setPosition(target); setSenderError(''); }
   };
   const showChunk = () => {
     if (!prepared) return;
@@ -267,14 +379,11 @@ export default function App() {
       return;
     }
     const target = sequence.findIndex((step) => step.kind === 'data' && step.index === num - 1);
-    if (target >= 0) { setCameraTestMode(false); setPosition(target); setSenderError(''); }
-  };
-  const nextFrame = () => {
-    setCameraTestMode(false);
-    setPosition((current) => Math.min(current + 1, sequence.length - 1));
+    if (target >= 0) { setCameraTestMode(false); setTransferFinished(false); setPosition(target); setSenderError(''); }
   };
   const previousFrame = () => {
     setCameraTestMode(false);
+    setTransferFinished(false);
     setPosition((current) => Math.max(current - 1, 0));
   };
   const scanImage = async (file: File | undefined) => {
@@ -309,11 +418,11 @@ export default function App() {
         <span className="local-badge">100% client-side · QR optical transfer</span>
       </header>
       <div className="intro">
-        Open this website on two devices. Keep each Sender QR on screen until the Receiver confirms it, then click Next QR manually. No automatic switching or server transfer.
+        On two devices, start both cameras. Receiver displays an ACK QR to the left of its camera preview after accepting each Sender QR. Sender scans this ACK to display the next QR automatically. No server or timing-based advancement.
       </div>
       <div className="panels">
         <section className="panel sender" aria-label="Sender panel">
-          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>One QR at a time. Advance only after the Receiver confirms it.</p></div></div>
+          <div className="panel-title"><span className="step-dot">1</span><div><h1>Sender</h1><p>Holds each frame until its camera reads the Receiver ACK.</p></div></div>
           <label className="file-label" htmlFor="source-file">Choose file (maximum 2 MiB)</label>
           <input id="source-file" type="file" onChange={(event) => { void selectFile(event.currentTarget.files?.[0]); }} />
           {senderError && <p role="alert" className="error">{senderError}</p>}
@@ -331,12 +440,33 @@ export default function App() {
             ? `Metadata QR · part ${currentStep.index + 1} / ${metaCount}`
             : `Data QR · chunk ${currentStep.index + 1} / ${prepared.header.total}`) : 'No active transfer'}</div>
           <div className="toolbar">
-            <button disabled={!prepared || (!cameraTestMode && position === sequence.length - 1)} onClick={nextFrame}>Next QR</button>
-            <button className="secondary-button" disabled={!prepared || (!cameraTestMode && position === 0)} onClick={previousFrame}>Previous QR</button>
-            <button className="secondary-button" disabled={!prepared} onClick={() => { setCameraTestMode(false); setPosition(0); }}>Start over</button>
+            <button className="secondary-button" disabled={!prepared || position === 0} onClick={previousFrame}>Previous QR</button>
+            <button className="secondary-button" disabled={!prepared} onClick={() => { setCameraTestMode(false); setTransferFinished(false); setPosition(0); }}>Start over</button>
             <button className="secondary-button" onClick={() => setCameraTestMode((value) => !value)}>{cameraTestMode ? 'Return to transfer' : 'Show camera test QR'}</button>
           </div>
-          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. The QR remains fixed until you click Next QR; no auto-loop.</div>
+          <div className="line-muted">Frame {prepared ? position + 1 : 0} / {sequence.length}. {transferFinished ? 'Final ACK received: complete.' : 'Waiting for a matching optical ACK; the QR remains fixed.'}</div>
+          <div className="sender-ack-scanner">
+            <h2>Sender ACK camera</h2>
+            <div className="toolbar">
+              <button onClick={() => { if (ackCameraActive) stopAckCamera(); else void startAckCamera(ackCameraId); }}>{ackCameraActive ? 'Stop Sender camera' : 'Start Sender camera'}</button>
+            </div>
+            {!!ackCameraNames.length && <label className="camera-picker" htmlFor="ack-camera-select">Camera
+              <select id="ack-camera-select" value={ackCameraId} onChange={(event) => {
+                setAckCameraId(event.target.value);
+                if (ackCameraActive) void startAckCamera(event.target.value);
+              }}>
+                <option value="">Front camera (automatic)</option>
+                {ackCameraNames.map((device, index) => <option key={device.deviceId || index} value={device.deviceId}>{device.label || `Camera ${index + 1}`}</option>)}
+              </select>
+            </label>}
+            {ackCameraError && <p role="alert" className="error">{ackCameraError}</p>}
+            <div className="preview sender-ack-preview" aria-label="Sender ACK camera preview">
+              <video ref={ackVideoRef} muted autoPlay playsInline className="camera-video" />
+              {!ackCameraActive && <div className="preview-overlay">Sender camera is off</div>}
+            </div>
+            <canvas ref={ackCanvasRef} className="hidden-canvas" aria-hidden="true" />
+            <div className="line-muted sender-ack-status" aria-live="polite">{ackCameraStatus}</div>
+          </div>
           <div className="jump-row">
             <label htmlFor="jump-index">Show chunk #</label>
             <input id="jump-index" type="number" min="1" max={prepared?.header.total ?? 1} value={jumpIndex} onChange={(e) => setJumpIndex(e.target.value)} />
@@ -347,7 +477,7 @@ export default function App() {
             <input id="metadata-jump-index" type="number" min="1" max={metaCount || 1} value={metaJumpIndex} onChange={(e) => setMetaJumpIndex(e.target.value)} />
             <button className="secondary-button" disabled={!prepared} onClick={showMetadata}>Jump metadata</button>
           </div>
-          <p className="small-note">Watch the Receiver's accepted-frame message before clicking Next QR. A one-way optical link cannot automatically acknowledge a frame; you control advancement manually. You can go back to resend a missing QR.</p>
+          <p className="small-note">Sender advances only after its camera decodes an ACK matching the currently displayed transfer ID, frame kind, index and CRC. Use Previous or Jump to retry. Both devices need a working camera and screen.</p>
         </section>
         <section className="panel receiver" aria-label="Receiver panel">
           <div className="panel-title"><span className="step-dot purple">2</span><div><h1>Receiver</h1><p>Read QR codes using the front-facing camera.</p></div></div>
@@ -365,9 +495,22 @@ export default function App() {
             </select>
           </label>}
           {cameraError && <p className="error" role="alert">{cameraError}</p>}
-          <div className="preview" aria-label="Live receiver camera preview">
-            <video ref={videoRef} muted autoPlay playsInline className="camera-video" />
-            {!cameraActive && <div className="preview-overlay">Camera is off · HTTPS or localhost required</div>}
+          <div className="receiver-optical-row">
+            <div className="receiver-ack-column">
+              <h2>Received ACK QR</h2>
+              <div className="qr-box ack-qr" aria-label="Receiver acknowledgement QR">
+                {acknowledgementQR.image ? <img src={acknowledgementQR.image} alt="ACK QR for the last accepted frame" />
+                  : <div className="placeholder">ACK appears after a valid QR is received</div>}
+              </div>
+              <p className="qr-status">{receiver.lastAckLabel ? `ACK: ${receiver.lastAckLabel}` : 'Waiting for a valid frame'}</p>
+            </div>
+            <div className="receiver-camera-column">
+              <h2>Receiver camera</h2>
+              <div className="preview" aria-label="Live receiver camera preview">
+                <video ref={videoRef} muted autoPlay playsInline className="camera-video" />
+                {!cameraActive && <div className="preview-overlay">Camera is off · HTTPS or localhost required</div>}
+              </div>
+            </div>
           </div>
           <canvas ref={videoCanvasRef} className="hidden-canvas" aria-hidden="true" />
           <div className="image-fallback"><label htmlFor="qr-image">Or scan a QR screenshot:</label> <input id="qr-image" type="file" accept="image/*" onChange={(event) => { void scanImage(event.currentTarget.files?.[0]); event.currentTarget.value = ''; }}/></div>

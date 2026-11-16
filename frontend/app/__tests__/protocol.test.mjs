@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import {
-  acceptFrame, assemble, buildSequence, CHUNK_BYTES, META_BYTES, crc32,
+  acceptFrame, ackMatchesFrame, assemble, buildSequence, CHUNK_BYTES, META_BYTES, crc32,
+  decodeAck, encodeAck,
   decodeFrame, emptyReceiver, encodeData, encodeHeader, encodeStep,
   HEADER_INTERVAL, isComplete, MAGIC, MAX_FILE_BYTES, metadataPartCount,
   missingIndices, missingMetadataIndices, prepareFile,
@@ -111,4 +112,34 @@ test('rejects malformed or outdated QRs', async () => {
   assert.throws(() => decodeFrame('QRF1|D|0123456789ab|0|1|00000000|AA'), /Not a QRF2/);
   assert.throws(() => decodeFrame('QRF2|D|123|0|1|00000000|a'), /Invalid transfer ID/);
   assert.throws(() => decodeFrame('QRF2|D|0123456789ab|0|1|00000000|*'), /Invalid base64url/);
+});
+
+
+test('ACK QR matches only the exact transfer ID, frame kind, number and CRC', async () => {
+  const prepared = await prepareFile(file('ack.bin', new Uint8Array(CHUNK_BYTES + 1).fill(123)));
+  const code0 = encodeData(prepared, 0);
+  const code1 = encodeData(prepared, 1);
+  const frame0 = decodeFrame(code0);
+  const ack = decodeAck(encodeAck(frame0));
+  assert.ok(ackMatchesFrame(ack, frame0));
+  assert.equal(ackMatchesFrame(ack, decodeFrame(code1)), false);
+  assert.equal(ackMatchesFrame(ack, decodeFrame(encodeHeader(prepared, 0))), false);
+  const second = await prepareFile(file('ack.bin', new Uint8Array(CHUNK_BYTES + 1).fill(123)));
+  assert.equal(ackMatchesFrame(ack, decodeFrame(encodeData(second, 0))), false);
+  assert.throws(() => decodeAck('QRA1|not-an-id|D|0|2|00000000'), /Invalid ACK transfer ID/);
+  assert.throws(() => decodeAck('QRA1|0123456789ab|D|2|2|00000000'), /Integer out of bounds/);
+});
+
+test('Receiver shows ACK for accepted frames and retransmits ACK for duplicates', async () => {
+  const prepared = await prepareFile(file('ack.bin', new Uint8Array([3, 7])));
+  const first = encodeHeader(prepared, 0);
+  const frame = decodeFrame(first);
+  let receiver = acceptFrame(emptyReceiver(), frame, first);
+  assert.equal(receiver.lastAckQR, encodeAck(frame));
+  const next = encodeData(prepared, 0);
+  receiver = acceptFrame(receiver, decodeFrame(next), next);
+  assert.equal(receiver.lastAckQR, encodeAck(decodeFrame(next)));
+  receiver = acceptFrame(receiver, frame, first);
+  assert.equal(receiver.lastAckQR, encodeAck(frame));
+  assert.equal(receiver.received, 1);
 });

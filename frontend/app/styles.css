@@ -70,3 +70,16 @@ footer { margin-top:22px; padding-top:20px; border-top:1px solid #42304f; font-s
 .scan-debug strong { color:#f4df71; }
 /* The scanner reads the unmirrored source video; show the same orientation and avoid cropping. */
 .camera-video { transform:none; object-fit:contain; }
+
+/* Bidirectional optical ACK: the Receiver shows a short acknowledgement QR to the LEFT of its camera. */
+.receiver-optical-row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; align-items:start; }
+.receiver-optical-row h2, .sender-ack-scanner h2 { font-size:14px; margin:0 0 8px; }
+.receiver-ack-column, .receiver-camera-column { min-width:0; }
+.receiver-optical-row .qr-box { margin:0; }
+.ack-qr { min-height:220px; }
+.ack-qr img { display:block; max-width:100%; height:auto; }
+.receiver-optical-row .preview { margin:0; }
+.sender-ack-scanner { margin:14px 0; border:1px solid #655275; border-radius:10px; padding:12px; }
+.sender-ack-preview { max-width:390px; }
+.sender-ack-status { min-height:24px; }
+@media (max-width:620px) { .receiver-optical-row { grid-template-columns:1fr; } }
