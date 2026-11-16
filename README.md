@@ -1,8 +1,9 @@
 # [Client-Side QR File Transfer](https://github.com/europanite/client-side-qr-file-transfer)
 
 [![CI](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/ci.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/ci.yml)
-[![docker](https://github.com/europanite/semantic-tree/actions/workflows/docker.yml/badge.svg)](https://github.com/europanite/semantic-tree/actions/workflows/docker.yml)
+[![Docker](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/docker.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/docker.yml)
 [![GitHub Pages](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/pages.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/pages.yml)
+[![Browser E2E](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/e2e.yml/badge.svg)](https://github.com/europanite/client-side-qr-file-transfer/actions/workflows/e2e.yml)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![Architecture](https://img.shields.io/badge/architecture-client--side--only-yellow)
 
@@ -14,10 +15,10 @@ Transmit a small file **optically** between devices: one browser displays animat
 
 ## What it does
 
-- **Left panel / Sender**: choose a file, split it into 384-byte chunks, show a looping sequence of QR codes with configurable frame interval, pause, step, and jump to a numbered chunk.
+- **Left panel / Sender**: choose a file, split it into 48-byte chunks, show a looping sequence of QR codes with configurable frame interval, pause, step, and jump to a numbered chunk.
 - **Right panel / Receiver**: request the user-facing/front camera (or pick another camera), scan QR codes, count/deduplicate collected chunks, show the most recently received QR and a gallery of the last eight accepted QR codes, show missing chunk numbers, and download the reconstructed file once SHA-256 matches.
 - **No upload**: all encoding, checksum validation, QR rendering, scanning, reconstruction, and downloads happen in browser memory. Only application assets are fetched from the static host.
-- **Resilience**: out-of-order chunks, repeats, CRC32 checks per data QR, SHA-256 integrity of the completed file, and metadata re-emitted every 16 data chunks.
+- **Resilience**: out-of-order chunks, repeats, CRC32 checks per data QR, SHA-256 integrity of the completed file, and small metadata QR frames re-emitted every 64 data chunks.
 - **Alternative input**: a saved QR screenshot can be decoded using the Receiver's image selector when a physical camera is unavailable.
 
 ## Quick start (Docker Compose)
@@ -53,13 +54,13 @@ Open the local URL printed by Expo (usually `http://localhost:8081`). `localhost
 1. On device A, open the page, use **Choose file** under **Sender**, and point its screen toward device B's camera.
 2. On device B, open the **same website** and click **Start front camera**, permitting camera access.
 3. Watch **Received chunks** increase. Once all chunks and metadata are collected and the SHA-256 check passes, **Download verified file** appears.
-4. If some QR codes were missed, leave the Sender looping, reduce speed using the Frame interval slider, or **Jump & pause** on missing chunk numbers shown under the Receiver's **Missing QR chunks** section.
+4. If some QR codes were missed, leave the Sender looping, reduce speed using the Frame interval slider, or **Jump & pause** on missing data chunks or **Jump metadata** on missing metadata parts shown on the Receiver.
 5. Use **Reset received file** before receiving a different file. The Receiver deliberately ignores a second file's frames until reset to prevent mixing two transfers.
 
 ### Realistic speed and limits
 
-- Maximum file size is **2 MiB** (safety/memory/UI cap). For practical optical transfers, start with a file under **100 KiB**.
-- One QR carries **384 raw bytes**. Base64url makes the encoded QR around 550 printable characters including protocol fields.
+- Maximum file size is **2 MiB** (safety/memory/UI cap). For practical optical transfers with 48-byte data frames, start with a file under **5 KiB**.
+- Each QR carries at most **48 raw bytes**. Each data or metadata QR is typically under 110 printable characters including protocol fields. Smaller QR patterns are much easier for a typical front camera to scan, at the cost of approximately eight times as many data frames.
 - Default frame interval: **1.4 seconds**. Actual throughput depends on camera autofocus, resolution, exposure, QR display size, screen brightness, and decoding rate.
 - The sender has **no receiver acknowledgment**: it cannot automatically know whether a frame was received. It loops indefinitely; the Receiver deduplicates repeated frames.
 - Files are stored **in memory only**. Closing or refreshing the Receiver page loses the current transfer. No recovery across page reloads is implemented.
@@ -75,16 +76,16 @@ docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit --
 docker compose -f docker-compose.e2e.yml down
 ```
 
-## QR protocol v1 (`QRF1`)
+## QR protocol v2 (`QRF2`)
 
 All fields are ASCII separated by `|`, with base64url without padding for binary and UTF-8 text fields.
 
 ```text
-QRF1|H|<12-hex-transfer-id>|<number-of-chunks>|<file-size>|<sha256-hex>|<base64url-utf8-filename>|<base64url-utf8-mime>
-QRF1|D|<12-hex-transfer-id>|<0-based-index>|<number-of-chunks>|<crc32-hex>|<base64url-raw-bytes>
+QRF2|M|<12-hex-transfer-id>|<0-based-metadata-index>|<metadata-part-count>|<crc32-hex>|<base64url-metadata-part>
+QRF2|D|<12-hex-transfer-id>|<0-based-data-index>|<data-part-count>|<crc32-hex>|<base64url-data-part>
 ```
 
-A header is sent first and after every group of 16 data frames. The receiver can accept data before receiving metadata. CRC32 catches damaged individual data frames. The final file is rejected if its length or SHA-256 digest differs from the header. This provides **integrity checks, not authentication**.
+Metadata (file size, name, MIME type, SHA-256) is JSON-encoded and split into separate 48-byte fragments, rather than transmitted in one dense QR. Every metadata fragment is sent before data and repeated after each group of 64 data frames. Metadata and data can arrive out of order and are deduplicated. CRC32 catches damaged individual QR frames. The final file is rejected if its length or SHA-256 digest differs from the reconstructed metadata. This provides **integrity checks, not authentication**. `QRF2` requires both Sender and Receiver to run the updated application; older `QRF1` QR codes are intentionally not accepted.
 
 ## Build and GitHub Pages
 

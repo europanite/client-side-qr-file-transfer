@@ -65,3 +65,8 @@ footer { margin-top:22px; padding-top:20px; border-top:1px solid #42304f; font-s
 .received-tile img { display:block; width:100%; height:auto; background:#fff; }
 .received-tile span { display:block; margin-top:6px; }
 .thumbnail-loading { min-height:100px; display:grid; place-items:center; }
+
+.scan-debug { background:#261e33; border:1px solid #8466aa; border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:6px; color:#e3d7ee; font-size:13px; line-height:1.5; }
+.scan-debug strong { color:#f4df71; }
+/* The scanner reads the unmirrored source video; show the same orientation and avoid cropping. */
+.camera-video { transform:none; object-fit:contain; }

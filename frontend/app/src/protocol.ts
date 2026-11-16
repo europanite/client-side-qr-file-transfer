@@ -1,8 +1,11 @@
 /** Versioned, all-local file-over-QR protocol. Never transmits over a network. */
-export const MAGIC = 'QRF1';
-export const CHUNK_BYTES = 384;
+export const MAGIC = 'QRF2';
+// Keep each QR sparse enough for an ordinary laptop webcam to resolve.
+export const CHUNK_BYTES = 48;
+export const META_BYTES = 48;
+export const MAX_METADATA_PARTS = 20;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
-export const HEADER_INTERVAL = 16;
+export const HEADER_INTERVAL = 64;
 export const MAX_NAME_BYTES = 120;
 export const MAX_MIME_BYTES = 100;
 
@@ -10,14 +13,18 @@ export type HeaderFrame = {
   kind: 'header'; id: string; total: number; size: number;
   sha256: string; name: string; mime: string;
 };
+export type MetadataFrame = {
+  kind: 'metadata'; id: string; index: number; total: number; bytes: Uint8Array;
+};
 export type DataFrame = {
   kind: 'data'; id: string; index: number; total: number; bytes: Uint8Array;
 };
-export type Frame = HeaderFrame | DataFrame;
-export type FrameStep = { kind: 'header' } | { kind: 'data'; index: number };
-export type Prepared = { header: HeaderFrame; bytes: Uint8Array };
+export type Frame = MetadataFrame | DataFrame;
+export type FrameStep = { kind: 'metadata'; index: number } | { kind: 'data'; index: number };
+export type Prepared = { header: HeaderFrame; bytes: Uint8Array; metadata: Uint8Array };
 export type Receiver = {
   id: string | null; total: number | null; header: HeaderFrame | null;
+  metadata: Record<number, Uint8Array>; metadataTotal: number | null;
   chunks: Record<number, Uint8Array>; received: number;
   lastQR: string | null; lastLabel: string | null;
   history: { qr: string; label: string }[];
@@ -25,7 +32,8 @@ export type Receiver = {
 };
 
 export const emptyReceiver = (): Receiver => ({
-  id: null, total: null, header: null, chunks: {}, received: 0,
+  id: null, total: null, header: null, metadata: {}, metadataTotal: null,
+  chunks: {}, received: 0,
   lastQR: null, lastLabel: null, history: [], notice: 'Ready for QR codes',
 });
 
@@ -33,7 +41,6 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 function bytesToBase64(bytes: Uint8Array): string {
-  // Frames are small by design, so browser btoa's string limit is not approached.
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
@@ -52,7 +59,6 @@ export function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 export async function sha256(bytes: Uint8Array): Promise<string> {
-  // Use a standalone ArrayBuffer to satisfy current WebCrypto BufferSource typing.
   const buffer = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(buffer).set(bytes);
   return hex(new Uint8Array(await crypto.subtle.digest('SHA-256', buffer)));
@@ -68,7 +74,13 @@ export function crc32(bytes: Uint8Array): string {
 function safeFilename(name: string): string {
   return name.replace(/[\\/\x00-\x1f\x7f]/g, '_').trim() || 'received.bin';
 }
-
+function headerBytes(h: HeaderFrame): Uint8Array {
+  // Array saves repeated JSON property names on every transfer.
+  return encoder.encode(JSON.stringify([h.size, h.sha256, h.name, h.mime]));
+}
+export function metadataPartCount(prepared: Prepared): number {
+  return Math.ceil(prepared.metadata.length / META_BYTES);
+}
 export async function prepareFile(file: Pick<File, 'name' | 'type' | 'arrayBuffer' | 'size'>): Promise<Prepared> {
   assert(file.size <= MAX_FILE_BYTES, `File exceeds ${MAX_FILE_BYTES / 1024 / 1024} MiB limit`);
   const name = safeFilename(file.name);
@@ -83,29 +95,41 @@ export async function prepareFile(file: Pick<File, 'name' | 'type' | 'arrayBuffe
     kind: 'header', id, total, size: bytes.length,
     sha256: await sha256(bytes), name, mime,
   };
-  return { header, bytes };
+  const metadata = headerBytes(header);
+  assert(metadata.length <= META_BYTES * MAX_METADATA_PARTS, 'Metadata is too long');
+  return { header, bytes, metadata };
 }
 
-export function encodeHeader(h: HeaderFrame): string {
-  return [MAGIC, 'H', h.id, h.total, h.size, h.sha256,
-    bytesToBase64(encoder.encode(h.name)), bytesToBase64(encoder.encode(h.mime))].join('|');
+function encodeFragment(kind: 'M' | 'D', id: string, index: number, total: number, bytes: Uint8Array): string {
+  return [MAGIC, kind, id, index, total, crc32(bytes), bytesToBase64(bytes)].join('|');
+}
+export function encodeHeader(prepared: Prepared, index: number): string {
+  const total = metadataPartCount(prepared);
+  assert(Number.isInteger(index) && index >= 0 && index < total, 'Invalid metadata index');
+  return encodeFragment('M', prepared.header.id, index, total,
+    prepared.metadata.slice(index * META_BYTES, (index + 1) * META_BYTES));
 }
 export function encodeData(prepared: Prepared, index: number): string {
   assert(Number.isInteger(index) && index >= 0 && index < prepared.header.total, 'Invalid data index');
   const bytes = prepared.bytes.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
-  return [MAGIC, 'D', prepared.header.id, index, prepared.header.total, crc32(bytes), bytesToBase64(bytes)].join('|');
+  return encodeFragment('D', prepared.header.id, index, prepared.header.total, bytes);
 }
-export function buildSequence(total: number): FrameStep[] {
+export function buildSequence(total: number, metadataParts: number): FrameStep[] {
   assert(Number.isInteger(total) && total >= 1 && total <= Math.ceil(MAX_FILE_BYTES / CHUNK_BYTES), 'Invalid frame count');
-  const steps: FrameStep[] = [{ kind: 'header' }];
+  assert(Number.isInteger(metadataParts) && metadataParts >= 1 && metadataParts <= MAX_METADATA_PARTS, 'Invalid metadata part count');
+  const steps: FrameStep[] = [];
+  const addMetadata = () => {
+    for (let index = 0; index < metadataParts; index += 1) steps.push({ kind: 'metadata', index });
+  };
+  addMetadata();
   for (let index = 0; index < total; index += 1) {
-    if (index !== 0 && index % HEADER_INTERVAL === 0) steps.push({ kind: 'header' });
+    if (index !== 0 && index % HEADER_INTERVAL === 0) addMetadata();
     steps.push({ kind: 'data', index });
   }
   return steps;
 }
 export function encodeStep(prepared: Prepared, step: FrameStep): string {
-  return step.kind === 'header' ? encodeHeader(prepared.header) : encodeData(prepared, step.index);
+  return step.kind === 'metadata' ? encodeHeader(prepared, step.index) : encodeData(prepared, step.index);
 }
 function parseInteger(value: string, lower: number, upper: number): number {
   assert(/^(0|[1-9][0-9]*)$/.test(value), 'Invalid integer');
@@ -114,60 +138,100 @@ function parseInteger(value: string, lower: number, upper: number): number {
   return parsed;
 }
 export function decodeFrame(qr: string): Frame {
-  assert(qr.length <= 2048, 'QR payload too large');
+  assert(qr.length <= 160, 'QR payload too large');
   const parts = qr.split('|');
-  assert(parts[0] === MAGIC, 'Not a QRF1 frame');
+  assert(parts[0] === MAGIC, 'Not a QRF2 frame');
+  assert(parts.length === 7, 'Malformed QR frame');
   assert(parts[2] !== undefined && /^[0-9a-f]{12}$/.test(parts[2]), 'Invalid transfer ID');
-  const id = parts[2];
-  const maxTotal = Math.ceil(MAX_FILE_BYTES / CHUNK_BYTES);
-  if (parts[1] === 'H') {
-    assert(parts.length === 8, 'Malformed header');
-    const total = parseInteger(parts[3], 1, maxTotal);
-    const size = parseInteger(parts[4], 0, MAX_FILE_BYTES);
-    assert(total === Math.max(1, Math.ceil(size / CHUNK_BYTES)), 'Header chunk count does not match file size');
-    assert(/^[0-9a-f]{64}$/.test(parts[5]), 'Invalid SHA-256');
-    const name = safeFilename(decoder.decode(base64ToBytes(parts[6], MAX_NAME_BYTES)));
-    const mime = decoder.decode(base64ToBytes(parts[7], MAX_MIME_BYTES)) || 'application/octet-stream';
-    return { kind: 'header', id, total, size, sha256: parts[5], name, mime };
-  }
-  assert(parts[1] === 'D' && parts.length === 7, 'Malformed data frame');
-  const total = parseInteger(parts[4], 1, maxTotal);
+  const isMetadata = parts[1] === 'M';
+  assert(isMetadata || parts[1] === 'D', 'Invalid frame kind');
+  const limit = isMetadata ? MAX_METADATA_PARTS : Math.ceil(MAX_FILE_BYTES / CHUNK_BYTES);
+  const total = parseInteger(parts[4], 1, limit);
   const index = parseInteger(parts[3], 0, total - 1);
   assert(/^[0-9a-f]{8}$/.test(parts[5]), 'Invalid CRC32');
-  const bytes = base64ToBytes(parts[6], CHUNK_BYTES);
-  assert(index === total - 1 || bytes.length === CHUNK_BYTES, 'Non-final chunk is short');
+  const maxBytes = isMetadata ? META_BYTES : CHUNK_BYTES;
+  const bytes = base64ToBytes(parts[6], maxBytes);
+  assert(index === total - 1 || bytes.length === maxBytes, 'Non-final chunk is short');
+  assert(isMetadata ? bytes.length > 0 : true, 'Empty metadata part');
   assert(crc32(bytes) === parts[5], 'Data checksum mismatch');
-  return { kind: 'data', id, total, index, bytes };
+  return { kind: isMetadata ? 'metadata' : 'data', id: parts[2], total, index, bytes } as Frame;
 }
 
+function parseHeader(state: Receiver): HeaderFrame {
+  assert(state.metadataTotal !== null, 'Missing metadata');
+  const blocks: Uint8Array[] = [];
+  let length = 0;
+  for (let i = 0; i < state.metadataTotal; i += 1) {
+    const block = state.metadata[i];
+    assert(block, 'Missing metadata part');
+    blocks.push(block);
+    length += block.length;
+  }
+  const complete = new Uint8Array(length);
+  let offset = 0;
+  for (const block of blocks) { complete.set(block, offset); offset += block.length; }
+  const parsed: unknown = JSON.parse(decoder.decode(complete));
+  assert(Array.isArray(parsed) && parsed.length === 4, 'Invalid metadata payload');
+  const [size, sha, name, mime] = parsed;
+  assert(Number.isSafeInteger(size) && size >= 0 && size <= MAX_FILE_BYTES, 'Invalid file size');
+  assert(typeof sha === 'string' && /^[0-9a-f]{64}$/.test(sha), 'Invalid SHA-256');
+  assert(typeof name === 'string' && encoder.encode(name).length <= MAX_NAME_BYTES, 'Invalid filename');
+  assert(typeof mime === 'string' && encoder.encode(mime).length <= MAX_MIME_BYTES, 'Invalid MIME type');
+  return {
+    kind: 'header', id: state.id!, size, total: Math.max(1, Math.ceil(size / CHUNK_BYTES)),
+    sha256: sha, name: safeFilename(name), mime: mime || 'application/octet-stream',
+  };
+}
+function remember(state: Receiver, raw: string, label: string, notice: string): Receiver {
+  return { ...state, lastQR: raw, lastLabel: label,
+    history: [...state.history.slice(-7), { qr: raw, label }], notice };
+}
 export function acceptFrame(state: Receiver, frame: Frame, raw: string): Receiver {
   if (state.id && state.id !== frame.id) {
     return { ...state, notice: 'Different transfer detected. Reset receiver to switch files.' };
   }
+  if (frame.kind === 'metadata') {
+    if (state.metadataTotal !== null && state.metadataTotal !== frame.total) {
+      return { ...state, notice: 'Conflicting metadata part count; ignored.' };
+    }
+    if (state.metadata[frame.index]) return state;
+    const next: Receiver = {
+      ...state, id: frame.id, metadataTotal: frame.total,
+      metadata: { ...state.metadata, [frame.index]: frame.bytes },
+    };
+    const label = `Metadata ${frame.index + 1} / ${frame.total}`;
+    if (Object.keys(next.metadata).length !== frame.total) {
+      return remember(next, raw, label, `Received metadata part ${frame.index + 1} / ${frame.total}`);
+    }
+    try {
+      const header = parseHeader(next);
+      if (next.total !== null && next.total !== header.total) {
+        return { ...next, notice: 'Conflicting metadata/data frame count; ignored.' };
+      }
+      return remember({ ...next, total: header.total, header }, raw, label, 'File metadata received');
+    } catch (error) {
+      return { ...next, notice: `Invalid metadata: ${String(error)}` };
+    }
+  }
   if (state.total !== null && state.total !== frame.total) {
     return { ...state, notice: 'Conflicting frame count; ignored.' };
   }
-  if (frame.kind === 'header') {
-    if (state.header && JSON.stringify(state.header) !== JSON.stringify(frame)) {
-      return { ...state, notice: 'Conflicting metadata; ignored.' };
-    }
-    if (state.header) return state;
-    return { ...state, id: frame.id, total: frame.total, header: frame,
-      lastQR: raw, lastLabel: 'Metadata',
-      history: [...state.history.slice(-7), { qr: raw, label: 'Metadata' }],
-      notice: 'File metadata received' };
-  }
-  if (state.chunks[frame.index]) return state; // deduplicate cycles
-  return { ...state, id: frame.id, total: frame.total,
+  if (state.chunks[frame.index]) return state;
+  return remember({ ...state, id: frame.id, total: frame.total,
     chunks: { ...state.chunks, [frame.index]: frame.bytes }, received: state.received + 1,
-    lastQR: raw, lastLabel: `Chunk ${frame.index + 1} / ${frame.total}`,
-    history: [...state.history.slice(-7), { qr: raw, label: `Chunk ${frame.index + 1}` }],
-    notice: `Received chunk ${frame.index + 1} / ${frame.total}` };
+  }, raw, `Chunk ${frame.index + 1} / ${frame.total}`,
+  `Received chunk ${frame.index + 1} / ${frame.total}`);
 }
 export function missingIndices(state: Receiver): number[] {
   if (state.total === null) return [];
   const missing: number[] = [];
   for (let i = 0; i < state.total; i += 1) if (!state.chunks[i]) missing.push(i);
+  return missing;
+}
+export function missingMetadataIndices(state: Receiver): number[] {
+  if (state.metadataTotal === null) return [];
+  const missing: number[] = [];
+  for (let i = 0; i < state.metadataTotal; i += 1) if (!state.metadata[i]) missing.push(i);
   return missing;
 }
 export function isComplete(state: Receiver): boolean {
