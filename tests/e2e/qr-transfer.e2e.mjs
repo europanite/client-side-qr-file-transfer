@@ -168,14 +168,15 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       assert.ok(source?.startsWith('data:image/png;base64,'), 'Expected a rendered QR PNG');
       await receiver.evaluate(async (image) => window.__e2eCamera.setFrame(image), source);
       previousSource = source;
+      // The diagnostic box is also aria-live; only the transfer notice carries accepted-frame acknowledgments.
       if (expectedNotice) {
         try {
           await receiver.waitForFunction((notice) =>
-            document.querySelector('.receiver [aria-live="polite"]')?.textContent?.includes(notice),
+            document.querySelector('.receiver .line-muted[aria-live="polite"]')?.textContent?.includes(notice),
           expectedNotice, { timeout: 15_000 });
         } catch (error) {
           const state = await receiver.evaluate(() => ({
-            notice: document.querySelector('.receiver [aria-live="polite"]')?.textContent,
+            notice: document.querySelector('.receiver .line-muted[aria-live="polite"]')?.textContent,
             progress: Array.from(document.querySelectorAll('.receiver .progress-label'))
               .find((element) => element.querySelector('span')?.textContent?.trim() === 'Received chunks')
               ?.querySelector('strong')?.textContent,
@@ -205,9 +206,12 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       await sender.locator('#source-file').setInputFiles({
         name, mimeType: 'application/octet-stream', buffer,
       });
-      await sender.getByRole('button', { name: 'Pause', exact: true }).click();
       await sender.waitForFunction((total) =>
         document.querySelector('.sender .stats')?.textContent?.includes(`Chunks: ${total}`), chunkCount);
+      const initialFrame = await waitForVisibleQr(sender, 'Metadata QR · part 1 /', previousSource);
+      await sender.waitForTimeout(1700);
+      assert.equal(await sender.locator('.sender-qr img').getAttribute('src'), initialFrame,
+        'Sender must hold its QR steady until a person clicks Next QR');
       await scanMetadata();
     }
     async function verifyDownload(name, original) {
@@ -220,9 +224,18 @@ test('two browsers scan rendered QR frames and download byte-identical files', {
       assert.deepEqual(restored, original, 'Reconstructed bytes differ from source bytes');
     }
 
+    // Confirm the physical QR decoding path separately from the file protocol.
+    await sender.getByRole('button', { name: 'Show camera test QR' }).click();
+    await scan('Camera test QR', null);
+    await receiver.getByText('Camera test QR detected successfully').waitFor();
+    await sender.getByRole('button', { name: 'Return to transfer' }).click();
+
     const filename = '転送📁.bin';
     const payload = Buffer.from(Array.from({ length: 135 }, (_, n) => (n * 73 + (n >> 3)) & 255));
     await upload(filename, payload, 3);
+    await sender.getByRole('button', { name: 'Start over' }).click();
+    await sender.getByRole('button', { name: 'Next QR' }).click();
+    await sender.getByRole('button', { name: 'Previous QR' }).click();
     await jumpToChunk(2, 'Received chunk 2 / 3');
     await receivedCount(receiver, '1 / 3');
     await receiver.getByText('Missing QR chunks (2)').waitFor();
